@@ -3,32 +3,262 @@ const http = require("http");
 const PORT = process.env.PORT || 3000;
 const API = "https://external-api.kalshi.com/trade-api/v2";
 
-const ASSETS = [
-  { name: "Bitcoin", symbol: "BTC", series: "KXBTC15M" },
-  { name: "Ethereum", symbol: "ETH", series: "KXETH15M" }
-];
+const assets = {
+  BTC: { name: "Bitcoin", series: "KXBTC15M" },
+  ETH: { name: "Ethereum", series: "KXETH15M" }
+};
 
-// VIRTUAL WALLET
-const INITIAL_BALANCE = 5;
+let markets = { BTC: null, ETH: null };
+let errors = {};
+let lastScan = null;
 
 let wallet = {
-  balance: INITIAL_BALANCE,
+  startingBalance: 5,
+  cash: 5,
+  realizedPnL: 0,
   positions: [],
-  history: [],
-  nextId: 1
+  history: []
 };
 
-// MARKET DATA
-let marketData = {};
-let priceHistory = {
-  BTC: [],
-  ETH: []
-};
+let priceHistory = { BTC: [], ETH: [] };
 
-let lastScan = null;
-let scanErrors = {};
+async function apiGet(path) {
+  const response = await fetch(API + path);
 
-// HELPERS
+  if (!response.ok) {
+    throw new Error(`Kalshi API HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function number(value) {
+  const result = Number(value);
+  return Number.isFinite(result) ? result : null;
+}
+
+function getPrice(market, field) {
+  const dollars = number(market[field + "_dollars"]);
+  if (dollars !== null) return dollars;
+
+  const cents = number(market[field]);
+  return cents !== null ? cents / 100 : null;
+}
+
+function getQuotes(market) {
+  let yesBid = getPrice(market, "yes_bid");
+  let yesAsk = getPrice(market, "yes_ask");
+  let noBid = getPrice(market, "no_bid");
+  let noAsk = getPrice(market, "no_ask");
+
+  if (yesAsk === null && noBid !== null) yesAsk = 1 - noBid;
+  if (noAsk === null && yesBid !== null) noAsk = 1 - yesBid;
+
+  const yesMid =
+    yesBid !== null && yesAsk !== null
+      ? (yesBid + yesAsk) / 2
+      : null;
+
+  return { yesBid, yesAsk, noBid, noAsk, yesMid };
+}
+
+function getSignal(symbol, market, quotes) {
+  if (!market || quotes.yesMid === null) {
+    return { action: "WAIT", reason: "Waiting for market prices" };
+  }
+
+  const now = Date.now();
+
+  priceHistory[symbol].push({
+    time: now,
+    price: quotes.yesMid
+  });
+
+  priceHistory[symbol] = priceHistory[symbol].filter(
+    item => now - item.time <= 120000
+  );
+
+  const old = priceHistory[symbol].find(
+    item => now - item.time >= 20000
+  );
+
+  if (!old) {
+    return {
+      action: "WAIT",
+      reason: "Collecting price history"
+    };
+  }
+
+  const move = quotes.yesMid - old.price;
+
+  const yesSpread =
+    quotes.yesAsk !== null && quotes.yesBid !== null
+      ? quotes.yesAsk - quotes.yesBid
+      : null;
+
+  if (yesSpread !== null && yesSpread > 0.10) {
+    return {
+      action: "WAIT",
+      reason: "Market spread is too wide",
+      move
+    };
+  }
+
+  if (move >= 0.02) {
+    return {
+      action: "BUY YES",
+      reason: "YES contract price is rising",
+      confidence: move >= 0.04 ? "MEDIUM" : "LOW",
+      move,
+      entryPrice: quotes.yesAsk
+    };
+  }
+
+  if (move <= -0.02) {
+    return {
+      action: "BUY NO",
+      reason: "YES contract price is falling",
+      confidence: move <= -0.04 ? "MEDIUM" : "LOW",
+      move,
+      entryPrice: quotes.noAsk
+    };
+  }
+
+  return {
+    action: "WAIT",
+    reason: "No qualifying price movement",
+    move
+  };
+}
+
+async function scanAsset(symbol) {
+  const config = assets[symbol];
+
+  try {
+    const data = await apiGet(
+      `/markets?series_ticker=${config.series}&status=open&limit=100`
+    );
+
+    const now = Date.now();
+
+    const availableMarkets = (data.markets || [])
+      .filter(market => {
+        const status = String(market.status || "").toLowerCase();
+        const closeTime = Date.parse(market.close_time);
+
+        return (
+          ["active", "open"].includes(status) &&
+          Number.isFinite(closeTime) &&
+          closeTime > now
+        );
+      })
+      .sort(
+        (a, b) =>
+          Date.parse(a.close_time) - Date.parse(b.close_time)
+      );
+
+    if (!availableMarkets.length) {
+      markets[symbol] = {
+        asset: config.name,
+        series: config.series,
+        count: (data.markets || []).length,
+        available: false,
+        signal: {
+          action: "WAIT",
+          reason: "No active market found"
+        }
+      };
+      return;
+    }
+
+    const market = availableMarkets[0];
+    const quotes = getQuotes(market);
+
+    const signal = getSignal(symbol, market, quotes);
+
+    markets[symbol] = {
+      asset: config.name,
+      series: config.series,
+      available: true,
+      count: availableMarkets.length,
+      ticker: market.ticker,
+      title: market.title,
+      status: market.status,
+      closeTime: market.close_time,
+      expirationTime: market.expiration_time,
+      yesBid: quotes.yesBid,
+      yesAsk: quotes.yesAsk,
+      noBid: quotes.noBid,
+      noAsk: quotes.noAsk,
+      yesMid: quotes.yesMid,
+      signal
+    };
+
+    delete errors[symbol];
+
+  } catch (error) {
+    errors[symbol] = error.message;
+  }
+}
+
+async function scanMarkets() {
+  await Promise.all([
+    scanAsset("BTC"),
+    scanAsset("ETH")
+  ]);
+
+  lastScan = new Date().toISOString();
+}
+
+function getPositionValue(position) {
+  const market = markets[position.symbol];
+
+  if (!market || !market.available) return 0;
+
+  const price =
+    position.side === "YES"
+      ? market.yesBid
+      : market.noBid;
+
+  return price === null || price === undefined
+    ? 0
+    : position.contracts * price;
+}
+
+function getStatus() {
+  const openValue = wallet.positions.reduce(
+    (total, position) => total + getPositionValue(position),
+    0
+  );
+
+  const unrealizedPnL = wallet.positions.reduce(
+    (total, position) =>
+      total + getPositionValue(position) - position.cost,
+    0
+  );
+
+  return {
+    status: "online",
+    lastScan,
+    markets,
+    wallet: {
+      startingBalance: wallet.startingBalance,
+      cash: Number(wallet.cash.toFixed(2)),
+      openPositions: wallet.positions.length,
+      openValue: Number(openValue.toFixed(2)),
+      realizedPnL: Number(wallet.realizedPnL.toFixed(2)),
+      unrealizedPnL: Number(unrealizedPnL.toFixed(2)),
+      totalEquity: Number((wallet.cash + openValue).toFixed(2)),
+      totalPnL: Number(
+        (wallet.realizedPnL + unrealizedPnL).toFixed(2)
+      ),
+      tradesClosed: wallet.history.length
+    },
+    positions: wallet.positions,
+    history: wallet.history
+  };
+}
+
 function send(res, status, data) {
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -40,531 +270,170 @@ function send(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function priceValue(market, dollarsField, centsField) {
-  if (market[dollarsField] != null) {
-    return Number(market[dollarsField]);
-  }
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
 
-  if (market[centsField] != null) {
-    return Number(market[centsField]) / 100;
-  }
-
-  return null;
-}
-
-function getQuotes(m) {
-  let yesBid = priceValue(m, "yes_bid_dollars", "yes_bid");
-  let yesAsk = priceValue(m, "yes_ask_dollars", "yes_ask");
-
-  let noBid = priceValue(m, "no_bid_dollars", "no_bid");
-  let noAsk = priceValue(m, "no_ask_dollars", "no_ask");
-
-  if (yesAsk == null && noBid != null) {
-    yesAsk = 1 - noBid;
-  }
-
-  if (noAsk == null && yesBid != null) {
-    noAsk = 1 - yesBid;
-  }
-
-  const last = priceValue(
-    m,
-    "last_price_dollars",
-    "last_price"
-  );
-
-  let mid = null;
-
-  if (yesBid != null && yesAsk != null) {
-    mid = (yesBid + yesAsk) / 2;
-  } else if (last != null) {
-    mid = last;
-  }
-
-  return {
-    yesBid,
-    yesAsk,
-    noBid,
-    noAsk,
-    last,
-    mid
-  };
-}
-
-async function kalshi(path) {
-  const controller = new AbortController();
-
-  const timer = setTimeout(() => controller.abort(), 12000);
-
-  try {
-    const response = await fetch(API + path, {
-      signal: controller.signal
-    });
-
-    if (!response.ok) {
-      throw new Error("Kalshi HTTP " + response.status);
-    }
-
-    return await response.json();
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// FIND CURRENT MARKET
-async function getActiveMarket(asset) {
-  const path =
-    "/markets?series_ticker=" +
-    encodeURIComponent(asset.series) +
-    "&status=open&limit=100";
-
-  const data = await kalshi(path);
-
-  const markets = (data.markets || []).filter(m => {
-    return (
-      m.ticker &&
-      m.ticker.startsWith(asset.series + "-")
-    );
-  });
-
-  const now = Date.now();
-
-  const active = markets.filter(m => {
-    if (m.status && m.status !== "open") return false;
-
-    const close = m.close_time
-      ? new Date(m.close_time).getTime()
-      : null;
-
-    return close == null || close > now;
-  });
-
-  active.sort((a, b) => {
-    const aTime = a.close_time
-      ? new Date(a.close_time).getTime()
-      : Infinity;
-
-    const bTime = b.close_time
-      ? new Date(b.close_time).getTime()
-      : Infinity;
-
-    return aTime - bTime;
-  });
-
-  return {
-    count: markets.length,
-    market: active[0] || null
-  };
-}
-
-// SIGNAL ENGINE
-function makeSignal(asset, market, quotes) {
-  const key = asset.symbol;
-  const now = Date.now();
-
-  const history = priceHistory[key];
-
-  if (quotes.mid != null) {
-    history.push({
-      time: now,
-      price: quotes.mid
-    });
-  }
-
-  // Keep the last two minutes.
-  priceHistory[key] = history.filter(
-    item => now - item.time <= 120000
-  );
-
-  const samples = priceHistory[key];
-
-  if (samples.length < 3) {
-    return {
-      action: "WAIT",
-      confidence: "BUILDING DATA",
-      reason: "Collecting market prices",
-      entryPrice: null,
-      movement: null
-    };
-  }
-
-  const reference = samples.find(
-    item => now - item.time >= 20000
-  );
-
-  if (!reference || quotes.mid == null) {
-    return {
-      action: "WAIT",
-      confidence: "BUILDING DATA",
-      reason: "Waiting for more price history",
-      entryPrice: null,
-      movement: null
-    };
-  }
-
-  const movement = quotes.mid - reference.price;
-
-  const spread =
-    quotes.yesBid != null && quotes.yesAsk != null
-      ? quotes.yesAsk - quotes.yesBid
-      : null;
-
-  if (spread != null && spread > 0.10) {
-    return {
-      action: "WAIT",
-      confidence: "LOW",
-      reason: "Market spread is too wide",
-      entryPrice: null,
-      movement
-    };
-  }
-
-  let action = "WAIT";
-  let entryPrice = null;
-  let confidence = "LOW";
-  let reason = "No clear momentum";
-
-  if (movement >= 0.02 && quotes.yesAsk != null) {
-    action = "BUY YES";
-    entryPrice = quotes.yesAsk;
-    confidence = movement >= 0.05 ? "MEDIUM" : "LOW";
-    reason = "YES contract price is rising";
-  } else if (
-    movement <= -0.02 &&
-    quotes.noAsk != null
-  ) {
-    action = "BUY NO";
-    entryPrice = quotes.noAsk;
-    confidence = movement <= -0.05 ? "MEDIUM" : "LOW";
-    reason = "YES contract price is falling";
-  }
-
-  return {
-    action,
-    confidence,
-    reason,
-    entryPrice,
-    movement,
-    spread
-  };
-}
-
-// SCAN MARKETS
-async function scanMarkets() {
-  for (const asset of ASSETS) {
-    try {
-      const result = await getActiveMarket(asset);
-
-      if (!result.market) {
-        marketData[asset.symbol] = {
-          asset: asset.name,
-          series: asset.series,
-          count: result.count,
-          available: false,
-          signal: {
-            action: "WAIT",
-            reason: "No active market found"
-          }
-        };
-
-        continue;
+    req.on("data", chunk => body += chunk);
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(body || "{}"));
+      } catch (error) {
+        reject(error);
       }
+    });
 
-      const market = result.market;
-      const quotes = getQuotes(market);
-      const signal = makeSignal(asset, market, quotes);
-
-      marketData[asset.symbol] = {
-        asset: asset.name,
-        symbol: asset.symbol,
-        series: asset.series,
-        available: true,
-        count: result.count,
-        ticker: market.ticker,
-        title: market.title,
-        closeTime: market.close_time,
-        status: market.status,
-        prices: quotes,
-        signal,
-        updatedAt: new Date().toISOString()
-      };
-
-      scanErrors[asset.symbol] = null;
-
-    } catch (error) {
-      scanErrors[asset.symbol] = error.message;
-
-      marketData[asset.symbol] = {
-        asset: asset.name,
-        series: asset.series,
-        available: false,
-        error: error.message
-      };
-    }
-  }
-
-  lastScan = new Date().toISOString();
+    req.on("error", reject);
+  });
 }
 
-// WALLET
-function getPositionValue(position) {
-  const current = marketData[position.symbol];
-
-  if (!current || !current.prices) return null;
-
-  const exitPrice = position.side === "YES"
-    ? current.prices.yesBid
-    : current.prices.noBid;
-
-  if (exitPrice == null) return null;
-
-  return exitPrice * position.contracts;
-}
-
-function getPerformance() {
-  let unrealized = 0;
-  let openValue = 0;
-
-  for (const position of wallet.positions) {
-    const value = getPositionValue(position);
-
-    if (value != null) {
-      openValue += value;
-      unrealized += value - position.cost;
-    }
-  }
-
-  const realized = wallet.history.reduce(
-    (total, trade) => total + trade.pnl,
-    0
-  );
-
-  return {
-    startingBalance: INITIAL_BALANCE,
-    cash: wallet.balance,
-    openPositions: wallet.positions.length,
-    openValue,
-    realizedPnL: realized,
-    unrealizedPnL: unrealized,
-    totalEquity: wallet.balance + openValue,
-    totalPnL: realized + unrealized,
-    tradesClosed: wallet.history.length
-  };
-}
-
-// MANUAL PAPER BUY
-function paperBuy(body) {
-  const symbol = String(body.symbol || "").toUpperCase();
-  const side = String(body.side || "").toUpperCase();
-  const amount = Number(body.amount);
-
-  if (!["BTC", "ETH"].includes(symbol)) {
-    throw new Error("Choose BTC or ETH");
-  }
-
-  if (!["YES", "NO"].includes(side)) {
-    throw new Error("Choose YES or NO");
-  }
-
-  if (!Number.isFinite(amount) || amount <= 0) {
-    throw new Error("Enter a valid amount");
-  }
-
-  const market = marketData[symbol];
-
-  if (!market || !market.available) {
-    throw new Error("Market is unavailable");
-  }
-
-  const entryPrice = side === "YES"
-    ? market.prices.yesAsk
-    : market.prices.noAsk;
-
-  if (entryPrice == null || entryPrice <= 0 || entryPrice > 1) {
-    throw new Error("Entry price unavailable");
-  }
-
-  const contracts = Math.floor(amount / entryPrice);
-
-  if (contracts < 1) {
-    throw new Error(
-      "Amount is too small for one contract"
-    );
-  }
-
-  const cost = contracts * entryPrice;
-
-  if (cost > wallet.balance) {
-    throw new Error("Not enough virtual cash");
-  }
-
-  wallet.balance -= cost;
-
-  const position = {
-    id: wallet.nextId++,
-    symbol,
-    asset: market.asset,
-    ticker: market.ticker,
-    side,
-    contracts,
-    entryPrice,
-    cost,
-    openedAt: new Date().toISOString()
-  };
-
-  wallet.positions.push(position);
-
-  return {
-    success: true,
-    position,
-    wallet: getPerformance()
-  };
-}
-
-// MANUAL PAPER SELL
-function paperSell(id) {
-  const index = wallet.positions.findIndex(
-    p => p.id === Number(id)
-  );
-
-  if (index === -1) {
-    throw new Error("Position not found");
-  }
-
-  const position = wallet.positions[index];
-  const value = getPositionValue(position);
-
-  if (value == null) {
-    throw new Error("Current exit price unavailable");
-  }
-
-  const current = marketData[position.symbol];
-
-  const exitPrice = position.side === "YES"
-    ? current.prices.yesBid
-    : current.prices.noBid;
-
-  const pnl = value - position.cost;
-
-  wallet.balance += value;
-
-  const closed = {
-    ...position,
-    exitPrice,
-    exitValue: value,
-    pnl,
-    closedAt: new Date().toISOString()
-  };
-
-  wallet.history.unshift(closed);
-  wallet.positions.splice(index, 1);
-
-  return {
-    success: true,
-    trade: closed,
-    wallet: getPerformance()
-  };
-}
-
-// HTTP SERVER
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
-    send(res, 200, {});
-    return;
+    return send(res, 200, { ok: true });
   }
 
-  const url = new URL(req.url, "http://localhost");
-
-  try {
-    if (url.pathname === "/" || url.pathname === "/health") {
-      send(res, 200, {
-        status: "online",
-        bot: "Kalshi Recommendation Bot",
-        version: "2.0"
-      });
-      return;
-    }
-
-    if (url.pathname === "/api/markets") {
-      send(res, 200, {
-        lastScan,
-        markets: marketData,
-        errors: scanErrors
-      });
-      return;
-    }
-
-    if (url.pathname === "/api/status") {
-      send(res, 200, {
-        status: "online",
-        lastScan,
-        markets: marketData,
-        wallet: getPerformance(),
-        positions: wallet.positions,
-        history: wallet.history
-      });
-      return;
-    }
-
-    if (url.pathname === "/api/paper/buy" && req.method === "POST") {
-      let body = "";
-
-      req.on("data", chunk => body += chunk);
-
-      req.on("end", () => {
-        try {
-          const result = paperBuy(JSON.parse(body || "{}"));
-          send(res, 200, result);
-        } catch (error) {
-          send(res, 400, { error: error.message });
-        }
-      });
-
-      return;
-    }
-
-    if (url.pathname === "/api/paper/sell" && req.method === "POST") {
-      let body = "";
-
-      req.on("data", chunk => body += chunk);
-
-      req.on("end", () => {
-        try {
-          const result = paperSell(JSON.parse(body || "{}"));
-          send(res, 200, result);
-        } catch (error) {
-          send(res, 400, { error: error.message });
-        }
-      });
-
-      return;
-    }
-
-    if (url.pathname === "/api/performance") {
-      send(res, 200, {
-        wallet: getPerformance(),
-        positions: wallet.positions,
-        history: wallet.history
-      });
-      return;
-    }
-
-    send(res, 404, { error: "Not found" });
-
-  } catch (error) {
-    send(res, 500, { error: error.message });
+  if (req.url === "/" || req.url === "/health") {
+    return send(res, 200, {
+      status: "online",
+      bot: "Kalshi Paper Trading Bot"
+    });
   }
+
+  if (req.url.startsWith("/api/markets")) {
+    return send(res, 200, {
+      lastScan,
+      markets,
+      errors
+    });
+  }
+
+  if (req.url === "/api/status") {
+    return send(res, 200, getStatus());
+  }
+
+  if (req.url === "/api/performance") {
+    return send(res, 200, {
+      wallet: getStatus().wallet,
+      positions: wallet.positions,
+      history: wallet.history
+    });
+  }
+
+  if (req.url === "/api/paper/buy" && req.method === "POST") {
+    try {
+      const body = await readBody(req);
+      const symbol = String(body.symbol || "").toUpperCase();
+      const side = String(body.side || "").toUpperCase();
+      const amount = number(body.amount);
+
+      if (!assets[symbol] || !["YES", "NO"].includes(side)) {
+        return send(res, 400, { error: "Invalid symbol or side" });
+      }
+
+      const market = markets[symbol];
+
+      if (!market || !market.available) {
+        return send(res, 400, { error: "No active market" });
+      }
+
+      const price = side === "YES"
+        ? market.yesAsk
+        : market.noAsk;
+
+      if (
+        price === null ||
+        price === undefined ||
+        price <= 0 ||
+        amount === null ||
+        amount <= 0 ||
+        amount > wallet.cash
+      ) {
+        return send(res, 400, { error: "Invalid amount or price" });
+      }
+
+      const contracts = Math.floor(amount / price);
+
+      if (contracts < 1) {
+        return send(res, 400, {
+          error: "Amount is too small for one contract"
+        });
+      }
+
+      const cost = Number((contracts * price).toFixed(2));
+
+      const position = {
+        id: require("crypto").randomUUID(),
+        symbol,
+        side,
+        ticker: market.ticker,
+        contracts,
+        entryPrice: price,
+        cost,
+        openedAt: new Date().toISOString()
+      };
+
+      wallet.cash = Number((wallet.cash - cost).toFixed(2));
+      wallet.positions.push(position);
+
+      return send(res, 200, {
+        success: true,
+        position,
+        status: getStatus()
+      });
+
+    } catch (error) {
+      return send(res, 400, { error: error.message });
+    }
+  }
+
+  if (req.url === "/api/paper/sell" && req.method === "POST") {
+    try {
+      const body = await readBody(req);
+
+      const index = wallet.positions.findIndex(
+        position => position.id === body.id
+      );
+
+      if (index === -1) {
+        return send(res, 404, { error: "Position not found" });
+      }
+
+      const position = wallet.positions[index];
+      const proceeds = getPositionValue(position);
+
+      wallet.cash = Number((wallet.cash + proceeds).toFixed(2));
+
+      const pnl = Number((proceeds - position.cost).toFixed(2));
+
+      wallet.realizedPnL += pnl;
+
+      wallet.history.unshift({
+        ...position,
+        exitValue: proceeds,
+        pnl,
+        closedAt: new Date().toISOString()
+      });
+
+      wallet.positions.splice(index, 1);
+
+      return send(res, 200, {
+        success: true,
+        pnl,
+        status: getStatus()
+      });
+
+    } catch (error) {
+      return send(res, 400, { error: error.message });
+    }
+  }
+
+  send(res, 404, { error: "Not found" });
 });
 
-// START
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("Kalshi recommendation server running on " + PORT);
+server.listen(PORT, async () => {
+  console.log(`Kalshi bot running on port ${PORT}`);
 
-  scanMarkets();
+  await scanMarkets();
 
   setInterval(scanMarkets, 10000);
-});
-
-server.on("error", error => {
-  console.error("SERVER ERROR:", error);
 });
