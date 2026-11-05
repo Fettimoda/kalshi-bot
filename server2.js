@@ -22,7 +22,7 @@ const SETTINGS = {
   predictionWindowSeconds: 10,
 
   minimumPredictedMoveCents: 2,
-  minimumSpotMovePercent: 2,
+  minimumSpotMovePercent: 0.02,
 
   takeProfit: 0.15,
   stopLoss: 0.12,
