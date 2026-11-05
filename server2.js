@@ -969,80 +969,6 @@ function buyPosition(
     };
   }
 
-  if (!["YES", "NO"].includes(side)) {
-    return {
-      success: false,
-      error: "Invalid trade side"
-    };
-  }
-
-  if (
-    wallet.positions.length >=
-    SETTINGS.maxOpenPositions
-  ) {
-    return {
-      success: false,
-      error: "Maximum open positions reached"
-    };
-  }
-
-  if (
-    countOpenPositions(symbol) >=
-    SETTINGS.maxOpenPositionsPerMarket
-  ) {
-    return {
-      success: false,
-      error: "Maximum positions for this crypto reached"
-    };
-  }
-
-  const quotes = getQuotes(market);
-
-  const entryPrice =
-    side === "YES"
-      ? quotes.yesAsk
-      : quotes.noAsk;
-
-  if (
-    entryPrice === null ||
-    entryPrice <= 0 ||
-    entryPrice >= 1
-  ) {
-    return {
-      success: false,
-      error: "Invalid contract price"
-    };
-  }
-
-  amount = number(amount);
-
-  if (
-    !amount ||
-    amount <= 0 ||
-    amount > wallet.cash
-  ) {
-    return {
-      success: false,
-      error: "Not enough virtual cash"
-    };
-  }
-
-  const contracts = amount / entryPrice;
-
-function buyPosition(
-  symbol,
-  side,
-  amount,
-  market,
-  signal
-) {
-  if (!market) {
-    return {
-      success: false,
-      error: "No active market"
-    };
-  }
-
   if (!assets[symbol]) {
     return {
       success: false,
@@ -1058,6 +984,13 @@ function buyPosition(
   }
 
   const ticker = getMarketTicker(market);
+
+  if (!ticker) {
+    return {
+      success: false,
+      error: "Market ticker unavailable"
+    };
+  }
 
   // Prevent duplicate positions on the same market
   const duplicate = wallet.positions.some(
@@ -1111,20 +1044,26 @@ function buyPosition(
 
   const cash = getAvailableBalance();
 
-  // Keep at least $0.50 in reserve
+  // Keep $0.50 in the virtual wallet as a reserve
   const reserve = 0.50;
-  const spendableCash = Math.max(0, cash - reserve);
+  const spendableCash = Math.max(
+    0,
+    cash - reserve
+  );
 
   const requestedAmount = number(amount);
 
-  if (!requestedAmount || requestedAmount <= 0) {
+  if (
+    requestedAmount === null ||
+    requestedAmount <= 0
+  ) {
     return {
       success: false,
       error: "Invalid trade amount"
     };
   }
 
-  // Never commit more than $1 to one position
+  // Maximum $1 per position
   amount = Math.min(
     requestedAmount,
     1,
@@ -1143,20 +1082,11 @@ function buyPosition(
   const position = {
     id: makePositionId(),
 
-    
-
-  return {
-    success: true,
-    position
-  };
-}
-
     symbol,
     asset: assets[symbol].name,
 
     side,
-
-    ticker: getMarketTicker(market),
+    ticker,
 
     amount,
     contracts,
@@ -1173,7 +1103,7 @@ function buyPosition(
 
     confidence: signal?.confidence || 0.5,
 
-    reason: signal?.reason || "Manual paper trade"
+    reason: signal?.reason || "Paper trade"
   };
 
   wallet.cash -= amount;
@@ -1192,7 +1122,6 @@ function buyPosition(
     position
   };
 }
-
 // ------------------------------
 // POSITION VALUE
 // ------------------------------
