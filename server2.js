@@ -21,8 +21,8 @@ const SETTINGS = {
   signalCooldown: 10000,
   predictionWindowSeconds: 10,
 
-  minimumPredictedMoveCents: 2,
-  minimumSpotMovePercent: 0.02,
+  minimumPredictedMoveCents: 1,
+  minimumSpotMovePercent: 0.005,
 
   takeProfit: 0.15,
   stopLoss: 0.12,
@@ -35,7 +35,7 @@ const SETTINGS = {
   endTradeMaxSpread: 0.05,
   endTradeMinDistanceBps: 8,
 
-  learningMinTrades: 10
+  learningMinTrades: 5
 };
 
 const assets = {
@@ -885,7 +885,7 @@ function getSignal(symbol, market) {
     };
   }
 
-  if (prediction.confidence < 0.55) {
+  if (prediction.confidence < 0.51) {
     return {
       action: "WAIT",
       reason: "Prediction confidence is too low",
