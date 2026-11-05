@@ -1143,40 +1143,7 @@ function buyPosition(
   const position = {
     id: makePositionId(),
 
-    symbol,
-    asset: assets[symbol].name,
-
-    side,
-    ticker,
-
-    amount,
-    contracts,
-
-    entryPrice,
-    currentPrice: entryPrice,
-
-    unrealizedPnL: 0,
-    highestPnLPercent: 0,
-
-    openedAt: new Date().toISOString(),
-
-    features: signal?.features || {},
-
-    confidence: signal?.confidence || 0.5,
-
-    reason: signal?.reason || "Automatic paper trade"
-  };
-
-  wallet.cash -= amount;
-
-  wallet.positions.push(position);
-
-  autoTrading.tradesOpened++;
-
-  autoTrading.lastAction =
-    `Bought ${side} ${symbol} for $${amount.toFixed(2)}`;
-
-  scheduleStateSave();
+    
 
   return {
     success: true,
