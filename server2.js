@@ -1029,8 +1029,160 @@ function buyPosition(
 
   const contracts = amount / entryPrice;
 
+function buyPosition(
+  symbol,
+  side,
+  amount,
+  market,
+  signal
+) {
+  if (!market) {
+    return {
+      success: false,
+      error: "No active market"
+    };
+  }
+
+  if (!assets[symbol]) {
+    return {
+      success: false,
+      error: "Invalid crypto symbol"
+    };
+  }
+
+  if (!["YES", "NO"].includes(side)) {
+    return {
+      success: false,
+      error: "Invalid trade side"
+    };
+  }
+
+  const ticker = getMarketTicker(market);
+
+  // Prevent duplicate positions on the same market
+  const duplicate = wallet.positions.some(
+    position => position.ticker === ticker
+  );
+
+  if (duplicate) {
+    return {
+      success: false,
+      error: "Already holding this market"
+    };
+  }
+
+  if (
+    wallet.positions.length >=
+    SETTINGS.maxOpenPositions
+  ) {
+    return {
+      success: false,
+      error: "Maximum open positions reached"
+    };
+  }
+
+  if (
+    countOpenPositions(symbol) >=
+    SETTINGS.maxOpenPositionsPerMarket
+  ) {
+    return {
+      success: false,
+      error: "Maximum positions for this crypto reached"
+    };
+  }
+
+  const quotes = getQuotes(market);
+
+  const entryPrice =
+    side === "YES"
+      ? quotes.yesAsk
+      : quotes.noAsk;
+
+  if (
+    entryPrice === null ||
+    entryPrice <= 0 ||
+    entryPrice >= 1
+  ) {
+    return {
+      success: false,
+      error: "Invalid contract price"
+    };
+  }
+
+  const cash = getAvailableBalance();
+
+  // Keep at least $0.50 in reserve
+  const reserve = 0.50;
+  const spendableCash = Math.max(0, cash - reserve);
+
+  const requestedAmount = number(amount);
+
+  if (!requestedAmount || requestedAmount <= 0) {
+    return {
+      success: false,
+      error: "Invalid trade amount"
+    };
+  }
+
+  // Never commit more than $1 to one position
+  amount = Math.min(
+    requestedAmount,
+    1,
+    spendableCash
+  );
+
+  if (amount < 0.25) {
+    return {
+      success: false,
+      error: "Insufficient available cash"
+    };
+  }
+
+  const contracts = amount / entryPrice;
+
   const position = {
     id: makePositionId(),
+
+    symbol,
+    asset: assets[symbol].name,
+
+    side,
+    ticker,
+
+    amount,
+    contracts,
+
+    entryPrice,
+    currentPrice: entryPrice,
+
+    unrealizedPnL: 0,
+    highestPnLPercent: 0,
+
+    openedAt: new Date().toISOString(),
+
+    features: signal?.features || {},
+
+    confidence: signal?.confidence || 0.5,
+
+    reason: signal?.reason || "Automatic paper trade"
+  };
+
+  wallet.cash -= amount;
+
+  wallet.positions.push(position);
+
+  autoTrading.tradesOpened++;
+
+  autoTrading.lastAction =
+    `Bought ${side} ${symbol} for $${amount.toFixed(2)}`;
+
+  scheduleStateSave();
+
+  return {
+    success: true,
+    position
+  };
+}
 
     symbol,
     asset: assets[symbol].name,
