@@ -12,28 +12,41 @@ const SETTINGS = {
   startingBalance: 5,
   tradeAmount: 1,
   regularMaxTradeAmount: 1.5,
-  maxOpenPositions: 2,
-  scanInterval: 10000,
-  signalCooldown: 60000,
+
+  maxOpenPositions: 4,
+  maxOpenPositionsPerMarket: 2,
+
+  scanInterval: 2000,
+  signalCooldown: 10000,
+  predictionWindowSeconds: 10,
+  minimumPredictedMoveCents: 2,
+  minimumSpotMovePercent: 2,
+
   takeProfit: 0.15,
   stopLoss: 0.12,
   trailingActivation: 0.10,
   trailingGiveback: 0.08,
 
-  // This can be switched on/off from the app through /api/settings.
   highConfidenceEndTrade: true,
-  endTradeWindowSeconds: 60,
+  endTradeWindowSeconds: 10,
   endTradeMinContractPrice: 0.90,
   endTradeMaxSpread: 0.05,
   endTradeMinDistanceBps: 8,
 
-  // Do not let the learned model control entries until it has some history.
   learningMinTrades: 10
 };
 
 const assets = {
-  BTC: { name: "Bitcoin", series: "KXBTC15M", binanceSymbol: "BTCUSDT" },
-  ETH: { name: "Ethereum", series: "KXETH15M", binanceSymbol: "ETHUSDT" }
+  BTC: {
+    name: "Bitcoin",
+    series: "KXBTC15M",
+    binanceSymbol: "BTCUSDT"
+  },
+  ETH: {
+    name: "Ethereum",
+    series: "KXETH15M",
+    binanceSymbol: "ETHUSDT"
+  }
 };
 
 const FEATURE_KEYS = [
@@ -102,8 +115,7 @@ function clamp(value, min, max) {
 }
 
 function logistic(value) {
-  const safe = clamp(value, -30, 30);
-  return 1 / (1 + Math.exp(-safe));
+  return 1 / (1 + Math.exp(-clamp(value, -30, 30)));
 }
 
 async function apiGet(path) {
@@ -119,15 +131,18 @@ async function supabaseRequest(path, options = {}) {
     throw new Error("Supabase environment variables are missing");
   }
 
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {})
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/${path}`,
+    {
+      ...options,
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+      }
     }
-  });
+  );
 
   const text = await response.text();
 
@@ -144,7 +159,7 @@ function supabaseReady() {
 
 async function loadPersistentState() {
   if (!supabaseReady()) {
-    console.log("Supabase is not configured; state will not survive restarts.");
+    console.log("Supabase is not configured.");
     return;
   }
 
@@ -154,7 +169,7 @@ async function loadPersistentState() {
     );
 
     if (!rows || !rows.length || !rows[0].data) {
-      console.log("No saved bot state yet. Starting with a new $5 paper wallet.");
+      console.log("Starting with a new $5 paper wallet.");
       return;
     }
 
@@ -162,19 +177,32 @@ async function loadPersistentState() {
 
     if (saved.wallet) {
       wallet = {
-        startingBalance: number(saved.wallet.startingBalance) ?? SETTINGS.startingBalance,
-        cash: number(saved.wallet.cash) ?? SETTINGS.startingBalance,
-        realizedPnL: number(saved.wallet.realizedPnL) ?? 0,
-        positions: Array.isArray(saved.wallet.positions) ? saved.wallet.positions : [],
-        history: Array.isArray(saved.wallet.history) ? saved.wallet.history : []
+        startingBalance:
+          number(saved.wallet.startingBalance) ?? 5,
+        cash:
+          number(saved.wallet.cash) ?? 5,
+        realizedPnL:
+          number(saved.wallet.realizedPnL) ?? 0,
+        positions:
+          Array.isArray(saved.wallet.positions)
+            ? saved.wallet.positions : [],
+        history:
+          Array.isArray(saved.wallet.history)
+            ? saved.wallet.history : []
       };
     }
 
     if (saved.settings) {
       for (const key of Object.keys(SETTINGS)) {
-        if (typeof saved.settings[key] === "boolean") {
+        if (
+          typeof SETTINGS[key] === "boolean" &&
+          typeof saved.settings[key] === "boolean"
+        ) {
           SETTINGS[key] = saved.settings[key];
-        } else if (number(saved.settings[key]) !== null) {
+        } else if (
+          typeof SETTINGS[key] === "number" &&
+          number(saved.settings[key]) !== null
+        ) {
           SETTINGS[key] = number(saved.settings[key]);
         }
       }
@@ -184,7 +212,7 @@ async function loadPersistentState() {
       autoTrading = { ...autoTrading, ...saved.autoTrading };
     }
 
-    if (saved.lastAutoTrade && typeof saved.lastAutoTrade === "object") {
+    if (saved.lastAutoTrade) {
       lastAutoTrade = saved.lastAutoTrade;
     }
 
@@ -192,18 +220,18 @@ async function loadPersistentState() {
       learningModel = {
         ...learningModel,
         ...saved.learningModel,
-        weights: { ...learningModel.weights, ...saved.learningModel.weights }
+        weights: {
+          ...learningModel.weights,
+          ...saved.learningModel.weights
+        }
       };
     }
 
-    console.log(
-      `Restored Supabase state: ${wallet.history.length} closed trades, ` +
-      `${wallet.positions.length} open positions, ` +
-      `${learningModel.closedTrades} learning samples.`
-    );
+    console.log("Previous bot state restored.");
+
   } catch (error) {
     supabaseError = error.message;
-    console.error("Could not restore Supabase state:", error.message);
+    console.error("Restore error:", error.message);
   }
 }
 
@@ -233,6 +261,7 @@ async function persistState() {
 
     lastSupabaseSave = new Date().toISOString();
     supabaseError = null;
+
   } catch (error) {
     supabaseError = error.message;
     console.error("Supabase save failed:", error.message);
@@ -241,12 +270,12 @@ async function persistState() {
 
 function scheduleStateSave() {
   if (!supabaseReady()) return;
+
   if (saveTimer) clearTimeout(saveTimer);
 
   saveTimer = setTimeout(() => {
     persistState().catch(error => {
       supabaseError = error.message;
-      console.error("Scheduled state save failed:", error.message);
     });
   }, 400);
 }
@@ -271,8 +300,7 @@ async function saveTradeLearning(position, pnl, outcome, closedAt) {
       body: JSON.stringify(row)
     });
   } catch (error) {
-    // A duplicate trade_id can happen if a close/save is retried.
-    console.error("Trade learning save failed:", error.message);
+    console.error("Learning save failed:", error.message);
   }
 }
 
@@ -290,8 +318,13 @@ function getQuotes(market) {
   let noBid = getPrice(market, "no_bid");
   let noAsk = getPrice(market, "no_ask");
 
-  if (yesAsk === null && noBid !== null) yesAsk = 1 - noBid;
-  if (noAsk === null && yesBid !== null) noAsk = 1 - yesBid;
+  if (yesAsk === null && noBid !== null) {
+    yesAsk = 1 - noBid;
+  }
+
+  if (noAsk === null && yesBid !== null) {
+    noAsk = 1 - yesBid;
+  }
 
   const yesMid =
     yesBid !== null && yesAsk !== null
@@ -299,947 +332,1206 @@ function getQuotes(market) {
       : null;
 
   return { yesBid, yesAsk, noBid, noAsk, yesMid };
+}async function fetchSpotPrice(symbol) {
+  const response = await fetch(
+    `${BINANCE_API}?symbol=${symbol}`
+  );
+
+  if (!response.ok) {
+    throw new Error(`Binance HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  return number(data.price);
+}
+
+function recordSpotPrice(symbol, price) {
+  const now = Date.now();
+
+  spotHistory[symbol].push({
+    time: now,
+    price
+  });
+
+  spotHistory[symbol] = spotHistory[symbol]
+    .filter(item => now - item.time <= 180000);
+}
+
+function recordContractPrice(symbol, price) {
+  if (price === null) return;
+
+  const now = Date.now();
+
+  priceHistory[symbol].push({
+    time: now,
+    price
+  });
+
+  priceHistory[symbol] = priceHistory[symbol]
+    .filter(item => now - item.time <= 180000);
+}
+
+function getHistoricalValue(history, secondsAgo, key = "price") {
+  if (!history || history.length < 2) return null;
+
+  const target = Date.now() - secondsAgo * 1000;
+  let closest = null;
+  let difference = Infinity;
+
+  for (const item of history) {
+    const currentDifference = Math.abs(item.time - target);
+
+    if (currentDifference < difference) {
+      difference = currentDifference;
+      closest = item;
+    }
+  }
+
+  if (!closest || difference > 12000) return null;
+  return number(closest[key]);
+}
+
+function calculateBps(current, previous) {
+  if (
+    current === null ||
+    previous === null ||
+    previous === 0
+  ) return null;
+
+  return ((current - previous) / previous) * 10000;
+}
+
+function getMarketTicker(market) {
+  return market?.ticker || market?.market_ticker || null;
+}
+
+function getMarketCloseTime(market) {
+  const value =
+    market?.close_time ||
+    market?.expiration_time ||
+    market?.expected_expiration_time;
+
+  if (!value) return null;
+
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function getSecondsRemaining(market) {
+  const closeTime = getMarketCloseTime(market);
+  if (!closeTime) return null;
+
+  return Math.max(0, Math.floor(
+    (closeTime - Date.now()) / 1000
+  ));
+}
+
+function getStrikePrice(market) {
+  const candidates = [
+    market?.floor_strike,
+    market?.strike_price,
+    market?.cap_strike,
+    market?.subtitle
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate === null || candidate === undefined) continue;
+
+    const match = String(candidate).match(/[\d,.]+/);
+    if (!match) continue;
+
+    const value = Number(match[0].replace(/,/g, ""));
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+
+  return null;
+}
+
+async function findActiveMarket(symbol) {
+  const series = assets[symbol].series;
+
+  const data = await apiGet(
+    `/markets?series_ticker=${encodeURIComponent(series)}&status=open&limit=100`
+  );
+
+  const list = Array.isArray(data.markets)
+    ? data.markets
+    : [];
+
+  const now = Date.now();
+
+  const active = list
+    .filter(market => {
+      const closeTime = getMarketCloseTime(market);
+      return closeTime && closeTime > now;
+    })
+    .sort((a, b) => {
+      return (
+        getMarketCloseTime(a) -
+        getMarketCloseTime(b)
+      );
+    });
+
+  return active[0] || null;
+}
+
+async function refreshMarket(symbol) {
+  try {
+    const current = markets[symbol];
+    const currentTicker = getMarketTicker(current);
+    const currentClose = getMarketCloseTime(current);
+
+    if (
+      currentTicker &&
+      currentClose &&
+      currentClose > Date.now()
+    ) {
+      const secondsLeft =
+        (currentClose - Date.now()) / 1000;
+
+      if (secondsLeft > 0) {
+        return current;
+      }
+    }
+
+    const market = await findActiveMarket(symbol);
+
+    if (!market) {
+      markets[symbol] = null;
+      errors[symbol] = "No active 15-minute market found";
+      return null;
+    }
+
+    markets[symbol] = market;
+    errors[symbol] = null;
+
+    return market;
+
+  } catch (error) {
+    errors[symbol] = error.message;
+    return markets[symbol] || null;
+  }
 }
 
 async function scanSpotPrice(symbol) {
   try {
-    const response = await fetch(
-      `${BINANCE_API}?symbol=${assets[symbol].binanceSymbol}`
+    const price = await fetchSpotPrice(
+      assets[symbol].binanceSymbol
     );
 
-    if (!response.ok) {
-      throw new Error(`Spot feed HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-    const price = number(data.price);
-
-    if (price === null) throw new Error("Spot feed returned no price");
-
-    const now = Date.now();
     spotPrices[symbol] = price;
-    spotHistory[symbol].push({ time: now, price });
+    recordSpotPrice(symbol, price);
 
-    spotHistory[symbol] = spotHistory[symbol].filter(
-      item => now - item.time <= 180000
-    );
+    return price;
 
-    delete errors[`${symbol}_SPOT`];
   } catch (error) {
-    errors[`${symbol}_SPOT`] = error.message;
+    errors[symbol] = error.message;
+    return null;
   }
 }
 
-function findOldSample(history, ageMs) {
-  const now = Date.now();
-  return history.find(item => now - item.time >= ageMs) || null;
+function getMarketSpread(quotes) {
+  if (
+    quotes.yesBid === null ||
+    quotes.yesAsk === null
+  ) return null;
+
+  return quotes.yesAsk - quotes.yesBid;
 }
 
-function getSignal(symbol, market, quotes) {
-  if (!market || quotes.yesMid === null) {
-    return { action: "WAIT", reason: "Waiting for market prices" };
-  }
+function getSignalFeatures(symbol, market, quotes) {
+  const spot = spotPrices[symbol];
+  const spotHistoryItems = spotHistory[symbol];
+  const contractHistory = priceHistory[symbol];
 
-  const now = Date.now();
-
-  priceHistory[symbol].push({ time: now, price: quotes.yesMid });
-  priceHistory[symbol] = priceHistory[symbol].filter(
-    item => now - item.time <= 120000
+  const oldSpot20 = getHistoricalValue(
+    spotHistoryItems, 20
   );
 
-  const old = findOldSample(priceHistory[symbol], 20000);
+  const oldSpot60 = getHistoricalValue(
+    spotHistoryItems, 60
+  );
 
-  if (!old) {
-    return { action: "WAIT", reason: "Collecting contract price history" };
-  }
+  const oldContract20 = getHistoricalValue(
+    contractHistory, 20
+  );
 
-  const move = quotes.yesMid - old.price;
-  const spread =
-    quotes.yesAsk !== null && quotes.yesBid !== null
-      ? quotes.yesAsk - quotes.yesBid
-      : null;
+  const oldContract60 = getHistoricalValue(
+    contractHistory, 60
+  );
 
-  if (spread !== null && spread > 0.10) {
-    return { action: "WAIT", reason: "Market spread is too wide", move };
-  }
-
-  if (move >= 0.02) {
-    return {
-      action: "BUY YES",
-      reason: "YES contract price is rising",
-      confidence: move >= 0.04 ? "MEDIUM" : "LOW",
-      move,
-      entryPrice: quotes.yesAsk
-    };
-  }
-
-  if (move <= -0.02) {
-    return {
-      action: "BUY NO",
-      reason: "YES contract price is falling",
-      confidence: move <= -0.04 ? "MEDIUM" : "LOW",
-      move,
-      entryPrice: quotes.noAsk
-    };
-  }
-
-  return { action: "WAIT", reason: "No qualifying price movement", move };
-}
-
-function makeFeatures(symbol, side, market) {
-  const sign = side === "YES" ? 1 : -1;
-  const contractHistory = priceHistory[symbol] || [];
-  const underlyingHistory = spotHistory[symbol] || [];
-  const now = Date.now();
-
-  const contractNow = market?.yesMid ?? null;
-  const contract20 = findOldSample(contractHistory, 20000);
-  const contract60 = findOldSample(contractHistory, 60000);
-  const spotNow = spotPrices[symbol];
-  const spot20 = findOldSample(underlyingHistory, 20000);
-  const spot60 = findOldSample(underlyingHistory, 60000);
+  const spot20Bps = calculateBps(spot, oldSpot20);
+  const spot60Bps = calculateBps(spot, oldSpot60);
 
   const contract20Cents =
-    contractNow !== null && contract20
-      ? (contractNow - contract20.price) * 100 * sign
-      : 0;
+    quotes.yesMid !== null && oldContract20 !== null
+      ? (quotes.yesMid - oldContract20) * 100
+      : null;
 
   const contract60Cents =
-    contractNow !== null && contract60
-      ? (contractNow - contract60.price) * 100 * sign
-      : 0;
+    quotes.yesMid !== null && oldContract60 !== null
+      ? (quotes.yesMid - oldContract60) * 100
+      : null;
 
-  const spot20Bps =
-    spotNow !== null && spot20 && spot20.price > 0
-      ? ((spotNow - spot20.price) / spot20.price) * 10000 * sign
-      : 0;
+  const spread = getMarketSpread(quotes);
+  const secondsRemaining = getSecondsRemaining(market);
 
-  const spot60Bps =
-    spotNow !== null && spot60 && spot60.price > 0
-      ? ((spotNow - spot60.price) / spot60.price) * 10000 * sign
-      : 0;
+  const strike = getStrikePrice(market);
 
-  const yesSpread =
-    market?.yesAsk !== null && market?.yesBid !== null
-      ? market.yesAsk - market.yesBid
-      : 0;
-
-  const closeAt = Date.parse(market?.closeTime || "");
-  const secondsRemaining = Number.isFinite(closeAt)
-    ? Math.max(0, (closeAt - now) / 1000)
-    : 900;
-
-  const strike = number(market?.floorStrike);
   const strikeDistanceBps =
-    spotNow !== null && strike !== null && strike > 0
-      ? ((spotNow - strike) / strike) * 10000 * sign
-      : 0;
+    strike && spot
+      ? ((spot - strike) / strike) * 10000
+      : null;
 
   return {
-    spot20Bps: clamp(spot20Bps, -50, 50),
-    spot60Bps: clamp(spot60Bps, -100, 100),
-    contract20Cents: clamp(contract20Cents, -20, 20),
-    contract60Cents: clamp(contract60Cents, -30, 30),
-    spreadCents: clamp(yesSpread * 100, 0, 20),
-    timeRemaining: clamp(secondsRemaining / 900, 0, 1),
-    strikeDistanceBps: clamp(strikeDistanceBps, -100, 100)
+    spot20Bps,
+    spot60Bps,
+    contract20Cents,
+    contract60Cents,
+    spreadCents:
+      spread === null ? null : spread * 100,
+    timeRemaining: secondsRemaining,
+    strikeDistanceBps
   };
 }
 
-function normalizedFeature(features, key) {
-  const scales = {
-    spot20Bps: 10,
-    spot60Bps: 20,
-    contract20Cents: 5,
-    contract60Cents: 10,
-    spreadCents: 10,
-    timeRemaining: 1,
-    strikeDistanceBps: 20
-  };
-
-  return clamp(
-    (number(features[key]) ?? 0) / (scales[key] || 1),
-    -3,
-    3
+function hasEnoughSignalData(features) {
+  return (
+    features.spot20Bps !== null &&
+    features.contract20Cents !== null &&
+    features.spreadCents !== null
   );
 }
 
-function predictWinProbability(features) {
+function predictMarketMove(features) {
   const weights = learningModel.weights;
-  let score = number(weights.bias) ?? 0;
+
+  let score = number(weights.bias) || 0;
 
   for (const key of FEATURE_KEYS) {
-    score += (number(weights[key]) ?? 0) * normalizedFeature(features, key);
+    const value = number(features[key]);
+
+    if (value === null) continue;
+
+    const scale =
+      key.includes("Cents") ? 10 :
+      key === "timeRemaining" ? 900 :
+      100;
+
+    score +=
+      (number(weights[key]) || 0) *
+      (value / scale);
   }
 
-  return logistic(score);
+  const probability = logistic(score);
+
+  return {
+    score,
+    yesProbability: probability,
+    noProbability: 1 - probability,
+    predictedSide:
+      probability >= 0.5 ? "YES" : "NO",
+    confidence:
+      Math.max(probability, 1 - probability)
+  };
 }
 
-function updateLearningModel(position, pnl) {
-  const features = position.features || {};
-  const target = pnl > 0 ? 1 : 0;
-  const probability = predictWinProbability(features);
-  const error = target - probability;
-  const learningRate = 0.035;
-  const regularization = 0.002;
-
-  learningModel.weights.bias = clamp(
-    learningModel.weights.bias + learningRate * error,
-    -5,
-    5
-  );
-
-  for (const key of FEATURE_KEYS) {
-    const x = normalizedFeature(features, key);
-    const oldWeight = number(learningModel.weights[key]) ?? 0;
-    const updated =
-      oldWeight + learningRate * (error * x - regularization * oldWeight);
-
-    learningModel.weights[key] = clamp(updated, -2, 2);
+function getSignal(symbol, market) {
+  if (!market) {
+    return {
+      action: "WAIT",
+      reason: "Waiting for an active market"
+    };
   }
 
-  learningModel.closedTrades++;
-  if (target === 1) learningModel.wins++;
-  else learningModel.losses++;
-
-  learningModel.lastUpdated = new Date().toISOString();
-}
-
-function getPositionPrice(position) {
-  const market = markets[position.symbol];
+  const quotes = getQuotes(market);
 
   if (
-    market &&
-    market.available &&
-    market.ticker === position.ticker
+    quotes.yesBid === null ||
+    quotes.yesAsk === null ||
+    quotes.noAsk === null
   ) {
-    return position.side === "YES" ? market.yesBid : market.noBid;
+    return {
+      action: "WAIT",
+      reason: "Waiting for market quotes"
+    };
   }
 
-  return position.lastPrice ?? position.entryPrice;
+  const features = getSignalFeatures(
+    symbol,
+    market,
+    quotes
+  );
+
+  recordContractPrice(symbol, quotes.yesMid);
+
+  if (!hasEnoughSignalData(features)) {
+    return {
+      action: "WAIT",
+      reason: "Collecting 20 seconds of price history",
+      features
+    };
+  }
+
+  const spread = getMarketSpread(quotes);
+
+  if (spread === null || spread > 0.10) {
+    return {
+      action: "WAIT",
+      reason: "Market spread is too wide",
+      features
+    };
+  }
+
+  const prediction = predictMarketMove(features);
+
+  const contractMove =
+    Math.abs(features.contract20Cents);
+
+  const spotMove =
+    Math.abs(features.spot20Bps || 0) / 100;
+
+  const contractOpportunity =
+    contractMove >= SETTINGS.minimumPredictedMoveCents;
+
+  const spotOpportunity =
+    spotMove >= SETTINGS.minimumSpotMovePercent;
+
+  if (!contractOpportunity && !spotOpportunity) {
+    return {
+      action: "WAIT",
+      reason: "No qualifying 10-second movement",
+      features,
+      prediction
+    };
+  }
+
+  if (prediction.confidence < 0.55) {
+    return {
+      action: "WAIT",
+      reason: "Prediction confidence is too low",
+      features,
+      prediction
+    };
+  }
+
+  return {
+    action: prediction.predictedSide === "YES"
+      ? "BUY_YES"
+      : "BUY_NO",
+    reason: contractOpportunity
+      ? "10-second contract movement detected"
+      : "10-second spot movement detected",
+    confidence: prediction.confidence,
+    features,
+    prediction,
+    quotes
+  };
+}// 10-second momentum prediction with adaptive learning.
+function predictMarketMove(features) {
+  const weights = learningModel.weights;
+
+  const contractMove =
+    number(features.contract20Cents) || 0;
+
+  const spotMove =
+    number(features.spot20Bps) || 0;
+
+  let score =
+    (contractMove / 5) +
+    (spotMove / 30);
+
+  // Learning adjustments are added after enough trades.
+  if (learningModel.closedTrades >= SETTINGS.learningMinTrades) {
+    for (const key of FEATURE_KEYS) {
+      const value = number(features[key]);
+
+      if (value === null) continue;
+
+      const scale =
+        key.includes("Cents") ? 10 :
+        key === "timeRemaining" ? 900 :
+        100;
+
+      score +=
+        (number(weights[key]) || 0) *
+        (value / scale);
+    }
+  }
+
+  const probability = logistic(score);
+
+  return {
+    score,
+    yesProbability: probability,
+    noProbability: 1 - probability,
+    predictedSide:
+      probability >= 0.5 ? "YES" : "NO",
+    confidence:
+      Math.max(probability, 1 - probability)
+  };
 }
 
-function getPositionValue(position) {
-  const price = getPositionPrice(position);
-  return price === null || price === undefined
-    ? 0
-    : position.contracts * price;
+function countOpenPositions(symbol) {
+  return wallet.positions.filter(position =>
+    position.symbol === symbol
+  ).length;
 }
 
-function buyPosition(symbol, side, amount, automatic = false, tradeType = "normal") {
-  const market = markets[symbol];
+function getAvailableBalance() {
+  return Math.max(0, number(wallet.cash) || 0);
+}
 
-  if (!market || !market.available) {
+function calculateTradeSize(confidence) {
+  const cash = getAvailableBalance();
+
+  if (cash <= 0) return 0;
+
+  let amount = SETTINGS.tradeAmount;
+
+  if (confidence >= 0.75) {
+    amount = SETTINGS.regularMaxTradeAmount;
+  } else if (confidence >= 0.65) {
+    amount = 1;
+  } else {
+    amount = 0.50;
+  }
+
+  return Math.min(
+    cash,
+    amount,
+    SETTINGS.regularMaxTradeAmount
+  );
+}
+
+function makePositionId() {
+  return crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random()}`;
+}
+
+function buyPosition(symbol, side, amount, market, signal) {
+  if (!market) {
     return { success: false, error: "No active market" };
+  }
+
+  if (!["YES", "NO"].includes(side)) {
+    return { success: false, error: "Invalid trade side" };
   }
 
   if (wallet.positions.length >= SETTINGS.maxOpenPositions) {
     return { success: false, error: "Maximum open positions reached" };
   }
 
-  const price = side === "YES" ? market.yesAsk : market.noAsk;
-
   if (
-    price === null ||
-    price === undefined ||
-    price <= 0 ||
-    amount <= 0 ||
-    amount > wallet.cash
+    countOpenPositions(symbol) >=
+    SETTINGS.maxOpenPositionsPerMarket
   ) {
-    return { success: false, error: "Invalid amount or price" };
-  }
-
-  const contracts = Math.floor(amount / price);
-  if (contracts < 1) {
     return {
       success: false,
-      error: "Amount is too small for one contract at this price"
+      error: `Maximum ${SETTINGS.maxOpenPositionsPerMarket} open ${symbol} positions reached`
     };
   }
 
-  const cost = Number((contracts * price).toFixed(2));
-  const features = makeFeatures(symbol, side, market);
+  const quotes = getQuotes(market);
+  const entryPrice = side === "YES"
+    ? quotes.yesAsk
+    : quotes.noAsk;
+
+  if (
+    entryPrice === null ||
+    entryPrice <= 0 ||
+    entryPrice >= 1
+  ) {
+    return { success: false, error: "Invalid contract price" };
+  }
+
+  amount = number(amount);
+
+  if (!amount || amount <= 0 || amount > wallet.cash) {
+    return { success: false, error: "Not enough virtual cash" };
+  }
+
+  const contracts = amount / entryPrice;
 
   const position = {
-    id: crypto.randomUUID(),
+    id: makePositionId(),
     symbol,
+    asset: assets[symbol].name,
     side,
-    ticker: market.ticker,
+    ticker: getMarketTicker(market),
+    amount,
     contracts,
-    entryPrice: price,
-    cost,
-    lastPrice: side === "YES" ? market.yesBid : market.noBid,
-    peakValue: cost,
+    entryPrice,
+    currentPrice: entryPrice,
+    unrealizedPnL: 0,
+    highestPnLPercent: 0,
     openedAt: new Date().toISOString(),
-    automatic,
-    tradeType,
-    features
+    features: signal?.features || {},
+    confidence: signal?.confidence || 0.5,
+    reason: signal?.reason || "Manual paper trade"
   };
 
-  wallet.cash = Number((wallet.cash - cost).toFixed(2));
+  wallet.cash -= amount;
   wallet.positions.push(position);
 
-  if (automatic) {
-    autoTrading.tradesOpened++;
-    autoTrading.lastAction = `AUTO BUY ${side} ${symbol} (${tradeType})`;
-  }
+  autoTrading.tradesOpened++;
+  autoTrading.lastAction =
+    `Bought ${side} ${symbol} for $${amount.toFixed(2)}`;
 
   scheduleStateSave();
-  return { success: true, position };
+
+  return {
+    success: true,
+    position
+  };
 }
 
-function closePosition(position, reason, settlementPrice = null) {
-  const index = wallet.positions.findIndex(item => item.id === position.id);
-  if (index === -1) return;
+function getPositionMark(position, market) {
+  if (!market) return null;
 
-  let proceeds;
+  const quotes = getQuotes(market);
 
-  if (settlementPrice !== null) {
-    proceeds = position.contracts * settlementPrice;
-  } else {
-    proceeds = getPositionValue(position);
+  return position.side === "YES"
+    ? quotes.yesBid
+    : quotes.noBid;
+}
+
+function updatePositionPrices() {
+  for (const position of wallet.positions) {
+    const market = markets[position.symbol];
+
+    if (!market) continue;
+
+    const currentPrice = getPositionMark(position, market);
+
+    if (currentPrice === null || currentPrice < 0) continue;
+
+    position.currentPrice = currentPrice;
+
+    const currentValue =
+      position.contracts * currentPrice;
+
+    position.unrealizedPnL =
+      currentValue - position.amount;
+
+    const pnlPercent =
+      position.amount > 0
+        ? position.unrealizedPnL / position.amount
+        : 0;
+
+    position.highestPnLPercent = Math.max(
+      position.highestPnLPercent || 0,
+      pnlPercent
+    );
+  }
+}
+
+function getPositionValue(position) {
+  return position.contracts * position.currentPrice;
+}
+
+function closePosition(positionId, reason = "Manual close") {
+  const index = wallet.positions.findIndex(
+    position => position.id === positionId
+  );
+
+  if (index === -1) {
+    return { success: false, error: "Position not found" };
   }
 
-  proceeds = Number(proceeds.toFixed(2));
-  const pnl = Number((proceeds - position.cost).toFixed(2));
+  const position = wallet.positions[index];
+  const market = markets[position.symbol];
+
+  const exitPrice = getPositionMark(position, market);
+
+  if (exitPrice === null) {
+    return {
+      success: false,
+      error: "Cannot close: current market price unavailable"
+    };
+  }
+
+  const proceeds = position.contracts * exitPrice;
+  const pnl = proceeds - position.amount;
+
+  wallet.cash += proceeds;
+  wallet.realizedPnL += pnl;
+
   const closedAt = new Date().toISOString();
 
-  wallet.cash = Number((wallet.cash + proceeds).toFixed(2));
-  wallet.realizedPnL = Number((wallet.realizedPnL + pnl).toFixed(2));
-
-  const closedTrade = {
+  const trade = {
     ...position,
-    exitValue: proceeds,
+    exitPrice,
+    proceeds,
     pnl,
-    closeReason: reason,
+    outcome: pnl >= 0 ? "WIN" : "LOSS",
+    reason,
     closedAt
   };
 
-  wallet.history.unshift(closedTrade);
+  wallet.history.unshift(trade);
   wallet.history = wallet.history.slice(0, 500);
+
   wallet.positions.splice(index, 1);
 
-  updateLearningModel(position, pnl);
-  saveTradeLearning(position, pnl, pnl > 0 ? "win" : "loss", closedAt)
-    .catch(error => console.error("Learning record error:", error.message));
+  autoTrading.tradesClosed++;
+  autoTrading.lastAction =
+    `Closed ${position.side} ${position.symbol}: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`;
 
-  if (position.automatic) {
-    autoTrading.tradesClosed++;
-    autoTrading.lastAction = `AUTO SELL ${position.symbol}: ${reason}`;
-  }
+  updateLearningModel(trade);
+  saveTradeLearning(
+    position,
+    pnl,
+    trade.outcome,
+    closedAt
+  ).catch(() => {});
 
   scheduleStateSave();
+
+  return {
+    success: true,
+    trade
+  };
 }
 
-async function checkSettledPosition(position) {
+function updateLearningModel(trade) {
+  learningModel.closedTrades++;
+
+  if (trade.pnl >= 0) {
+    learningModel.wins++;
+  } else {
+    learningModel.losses++;
+  }
+
+  const features = trade.features || {};
+  const direction = trade.side === "YES" ? 1 : -1;
+  const result = trade.pnl >= 0 ? 1 : -1;
+
+  const adjustment =
+    0.02 * direction * result;
+
+  for (const key of FEATURE_KEYS) {
+    const value = number(features[key]);
+
+    if (value === null) continue;
+
+    const scale =
+      key.includes("Cents") ? 10 :
+      key === "timeRemaining" ? 900 :
+      100;
+
+    const normalized = clamp(value / scale, -2, 2);
+
+    learningModel.weights[key] = clamp(
+      (learningModel.weights[key] || 0) +
+      adjustment * normalized,
+      -2,
+      2
+    );
+  }
+
+  learningModel.lastUpdated =
+    new Date().toISOString();
+}function automaticBuy(symbol, market, signal) {
+  if (!autoTrading.enabled) return;
+
+  if (!signal || !signal.action.startsWith("BUY_")) return;
+
   const now = Date.now();
+  const lastTrade = lastAutoTrade[symbol] || 0;
 
-  if (position.lastSettlementCheck && now - position.lastSettlementCheck < 10000) {
-    return false;
+  if (now - lastTrade < SETTINGS.signalCooldown) return;
+
+  if (countOpenPositions(symbol) >= SETTINGS.maxOpenPositionsPerMarket) {
+    return;
   }
 
-  position.lastSettlementCheck = now;
+  if (wallet.positions.length >= SETTINGS.maxOpenPositions) {
+    return;
+  }
 
-  try {
-    const data = await apiGet(`/markets/${encodeURIComponent(position.ticker)}`);
-    const market = data.market || data;
-    const result = String(market.result || "").toLowerCase();
+  const secondsRemaining = getSecondsRemaining(market);
 
-    if (result === "yes" || result === "no") {
-      const won = result === position.side.toLowerCase();
-      closePosition(
-        position,
-        `Market settled ${result.toUpperCase()}`,
-        won ? 1 : 0
-      );
-      return true;
-    }
+  if (
+    secondsRemaining !== null &&
+    secondsRemaining <= 0
+  ) return;
 
-    return false;
-  } catch (error) {
-    console.error(`Settlement check failed for ${position.ticker}:`, error.message);
-    return false;
+  const side = signal.action === "BUY_YES" ? "YES" : "NO";
+
+  const amount = calculateTradeSize(signal.confidence || 0.5);
+
+  if (amount <= 0) return;
+
+  const result = buyPosition(
+    symbol,
+    side,
+    amount,
+    market,
+    signal
+  );
+
+  if (result.success) {
+    lastAutoTrade[symbol] = now;
+    scheduleStateSave();
   }
 }
 
-async function manageAutomaticTrades() {
+function automaticExitChecks() {
+  updatePositionPrices();
+
   for (const position of [...wallet.positions]) {
     const market = markets[position.symbol];
 
-    if (!market || market.ticker !== position.ticker) {
-      // Do not pretend the last quote is the settlement result.
-      // Keep the position open until Kalshi publishes YES/NO settlement.
-      await checkSettledPosition(position);
+    if (!market) continue;
+
+    const secondsRemaining = getSecondsRemaining(market);
+
+    const pnlPercent =
+      position.amount > 0
+        ? position.unrealizedPnL / position.amount
+        : 0;
+
+    if (secondsRemaining !== null && secondsRemaining <= 0) {
+      closePosition(position.id, "Market expired");
       continue;
     }
 
-    const bid = position.side === "YES" ? market.yesBid : market.noBid;
-
-    if (bid !== null && bid !== undefined) {
-      position.lastPrice = bid;
-    }
-
-    const value = getPositionValue(position);
-    const profitPercent = position.cost > 0
-      ? (value - position.cost) / position.cost
-      : 0;
-
-    if (value > position.peakValue) {
-      position.peakValue = value;
-    }
-
-    const peakProfit = position.cost > 0
-      ? (position.peakValue - position.cost) / position.cost
-      : 0;
-
-    if (profitPercent >= SETTINGS.takeProfit) {
-      closePosition(position, "Take profit");
+    if (pnlPercent >= SETTINGS.takeProfit) {
+      closePosition(position.id, "Take profit reached");
       continue;
     }
 
-    if (profitPercent <= -SETTINGS.stopLoss) {
-      closePosition(position, "Stop loss");
+    if (pnlPercent <= -SETTINGS.stopLoss) {
+      closePosition(position.id, "Stop loss reached");
       continue;
     }
 
     if (
-      peakProfit >= SETTINGS.trailingActivation &&
-      value <= position.peakValue * (1 - SETTINGS.trailingGiveback)
+      position.highestPnLPercent >= SETTINGS.trailingActivation &&
+      pnlPercent <=
+        position.highestPnLPercent - SETTINGS.trailingGiveback
     ) {
-      closePosition(position, "Trailing stop");
+      closePosition(position.id, "Trailing profit exit");
     }
-  }
-}
-
-function getMarketOutcomeFromSpot(market, spot) {
-  const strikeType = String(market.strike_type || "").toLowerCase();
-  const floor = number(market.floor_strike);
-  const cap = number(market.cap_strike);
-
-  if (spot === null || spot === undefined) return null;
-
-  if (strikeType === "greater" || strikeType === "greater_or_equal") {
-    if (floor === null) return null;
-    return {
-      side: spot >= floor ? "YES" : "NO",
-      distanceBps: Math.abs(spot - floor) / floor * 10000
-    };
-  }
-
-  if (strikeType === "less" || strikeType === "less_or_equal") {
-    const threshold = cap !== null ? cap : floor;
-    if (threshold === null) return null;
-    return {
-      side: spot <= threshold ? "YES" : "NO",
-      distanceBps: Math.abs(spot - threshold) / threshold * 10000
-    };
-  }
-
-  if (strikeType === "between" && floor !== null && cap !== null) {
-    const inside = spot >= floor && spot <= cap;
-    const distance = inside
-      ? Math.min(spot - floor, cap - spot)
-      : Math.min(Math.abs(spot - floor), Math.abs(spot - cap));
-
-    return {
-      side: inside ? "YES" : "NO",
-      distanceBps: distance / spot * 10000
-    };
-  }
-
-  // Do not guess the settlement rule for custom/structured markets.
-  return null;
-}
-
-function tryHighConfidenceEndTrade(symbol) {
-  if (!SETTINGS.highConfidenceEndTrade || !autoTrading.enabled) return false;
-  if (wallet.positions.length >= SETTINGS.maxOpenPositions) return false;
-  if (wallet.cash <= 0) return false;
-
-  const market = markets[symbol];
-  if (!market || !market.available) return false;
-
-  const closeTime = Date.parse(market.closeTime || "");
-  const secondsRemaining = (closeTime - Date.now()) / 1000;
-
-  if (
-    !Number.isFinite(secondsRemaining) ||
-    secondsRemaining <= 0 ||
-    secondsRemaining > SETTINGS.endTradeWindowSeconds
-  ) {
-    return false;
-  }
-
-  const outcome = getMarketOutcomeFromSpot(market.rawMarket || {}, spotPrices[symbol]);
-  if (!outcome) return false;
-
-  if (outcome.distanceBps < SETTINGS.endTradeMinDistanceBps) return false;
-
-  const side = outcome.side;
-  const ask = side === "YES" ? market.yesAsk : market.noAsk;
-  const bid = side === "YES" ? market.yesBid : market.noBid;
-
-  if (ask === null || ask === undefined || bid === null || bid === undefined) {
-    return false;
-  }
-
-  const spread = ask - bid;
-
-  if (ask < SETTINGS.endTradeMinContractPrice) return false;
-  if (spread < 0 || spread > SETTINGS.endTradeMaxSpread) return false;
-
-  const key = `${symbol}:${market.ticker}:END:${side}`;
-  const now = Date.now();
-
-  if (lastAutoTrade[key] && now - lastAutoTrade[key] < SETTINGS.signalCooldown) {
-    return false;
-  }
-
-  // Special end-of-market setting: may use all remaining virtual cash.
-  // Contract rounding can leave a small cash remainder.
-  const amount = wallet.cash;
-  const result = buyPosition(symbol, side, amount, true, "high-confidence-end");
-
-  if (result.success) {
-    lastAutoTrade[key] = now;
-    autoTrading.lastAction =
-      `HIGH-CONFIDENCE END TRADE ${side} ${symbol} (${Math.floor(secondsRemaining)}s left)`;
-    scheduleStateSave();
-    return true;
-  }
-
-  return false;
-}
-
-function getAdaptiveTradeAmount(symbol, side, market) {
-  const features = makeFeatures(symbol, side, market);
-
-  if (learningModel.closedTrades < SETTINGS.learningMinTrades) {
-    return {
-      amount: market.signal?.confidence === "MEDIUM" ? 1 : 0.5,
-      probability: null,
-      features
-    };
-  }
-
-  const probability = predictWinProbability(features);
-
-  if (probability < 0.52) {
-    return { amount: 0, probability, features };
-  }
-
-  let amount = 0.5;
-  if (probability >= 0.75) amount = 1.5;
-  else if (probability >= 0.62) amount = 1.0;
-
-  return {
-    amount: Math.min(amount, SETTINGS.regularMaxTradeAmount),
-    probability,
-    features
-  };
-}
-
-function automaticBuy(symbol) {
-  if (!autoTrading.enabled) return;
-  if (wallet.positions.length >= SETTINGS.maxOpenPositions) return;
-
-  // Check the special final-minute strategy before ordinary signal entries.
-  if (tryHighConfidenceEndTrade(symbol)) return;
-
-  const market = markets[symbol];
-  if (!market || !market.available) return;
-
-  const signal = market.signal;
-  if (!signal || !["BUY YES", "BUY NO"].includes(signal.action)) return;
-
-  const closeTime = Date.parse(market.closeTime || "");
-  if (!Number.isFinite(closeTime) || closeTime - Date.now() < 30000) return;
-
-  const side = signal.action === "BUY YES" ? "YES" : "NO";
-  const key = `${symbol}:${market.ticker}:${side}`;
-  const now = Date.now();
-
-  if (
-    lastAutoTrade[key] &&
-    now - lastAutoTrade[key] < SETTINGS.signalCooldown
-  ) {
-    return;
-  }
-
-  const adaptive = getAdaptiveTradeAmount(symbol, side, market);
-
-  if (adaptive.amount <= 0) {
-    market.signal.learning = {
-      probability: adaptive.probability,
-      decision: "Filtered by learning model"
-    };
-    return;
-  }
-
-  const amount = Math.min(adaptive.amount, wallet.cash);
-  if (amount <= 0) return;
-
-  const result = buyPosition(symbol, side, amount, true, "adaptive");
-
-  if (result.success) {
-    lastAutoTrade[key] = now;
-    market.signal.learning = {
-      probability: adaptive.probability,
-      decision: "Trade accepted",
-      amount: result.position.cost
-    };
-    scheduleStateSave();
   }
 }
 
 async function scanAsset(symbol) {
-  const config = assets[symbol];
+  await scanSpotPrice(symbol);
 
-  try {
-    const data = await apiGet(
-      `/markets?series_ticker=${config.series}&status=open&limit=100`
-    );
+  const market = await refreshMarket(symbol);
 
-    const now = Date.now();
+  if (!market) return;
 
-    const availableMarkets = (data.markets || [])
-      .filter(market => {
-        const status = String(market.status || "").toLowerCase();
-        const closeTime = Date.parse(market.close_time);
+  const quotes = getQuotes(market);
 
-        return (
-          ["active", "open"].includes(status) &&
-          Number.isFinite(closeTime) &&
-          closeTime > now
-        );
-      })
-      .sort(
-        (a, b) =>
-          Date.parse(a.close_time) - Date.parse(b.close_time)
-      );
+  if (quotes.yesMid !== null) {
+    recordContractPrice(symbol, quotes.yesMid);
+  }
 
-    if (!availableMarkets.length) {
-      markets[symbol] = {
-        asset: config.name,
-        series: config.series,
-        count: (data.markets || []).length,
-        available: false,
-        spotPrice: spotPrices[symbol],
-        signal: { action: "WAIT", reason: "No active market found" }
-      };
-      return;
-    }
+  const signal = getSignal(symbol, market);
 
-    const market = availableMarkets[0];
-    const quotes = getQuotes(market);
-    const signal = getSignal(symbol, market, quotes);
-    const closeTime = Date.parse(market.close_time);
+  markets[symbol] = {
+    ...market,
+    botSignal: signal
+  };
 
-    markets[symbol] = {
-      asset: config.name,
-      series: config.series,
-      available: true,
-      count: availableMarkets.length,
-      ticker: market.ticker,
-      title: market.title,
-      status: market.status,
-      closeTime: market.close_time,
-      expirationTime: market.expected_expiration_time || market.expiration_time,
-      yesBid: quotes.yesBid,
-      yesAsk: quotes.yesAsk,
-      noBid: quotes.noBid,
-      noAsk: quotes.noAsk,
-      yesMid: quotes.yesMid,
-      floorStrike: number(market.floor_strike),
-      capStrike: number(market.cap_strike),
-      strikeType: market.strike_type || null,
-      spotPrice: spotPrices[symbol],
-      secondsRemaining: Number.isFinite(closeTime)
-        ? Math.max(0, (closeTime - now) / 1000)
-        : null,
-      signal,
-      rawMarket: market
-    };
-
-    delete errors[symbol];
-  } catch (error) {
-    errors[symbol] = error.message;
+  if (autoTrading.enabled) {
+    automaticBuy(symbol, market, signal);
   }
 }
 
-async function scanMarkets() {
+async function scanAll() {
   if (scanning) return;
+
   scanning = true;
 
   try {
-    await Promise.all([
-      scanSpotPrice("BTC"),
-      scanSpotPrice("ETH")
-    ]);
-
     await Promise.all([
       scanAsset("BTC"),
       scanAsset("ETH")
     ]);
 
-    await manageAutomaticTrades();
-
-    automaticBuy("BTC");
-    automaticBuy("ETH");
+    automaticExitChecks();
 
     lastScan = new Date().toISOString();
-    scheduleStateSave();
+
+  } catch (error) {
+    console.error("Scan error:", error.message);
+
   } finally {
     scanning = false;
   }
 }
 
-function getLearningStatus() {
-  const total = learningModel.closedTrades;
-  const winRate = total > 0
-    ? Number((learningModel.wins / total * 100).toFixed(1))
-    : 0;
+function getPublicMarket(symbol) {
+  const market = markets[symbol];
+
+  if (!market) {
+    return {
+      symbol,
+      name: assets[symbol].name,
+      available: false,
+      error: errors[symbol] || "Searching for market"
+    };
+  }
+
+  const quotes = getQuotes(market);
+  const signal = market.botSignal || null;
 
   return {
-    enabled: true,
-    mode: "adaptive",
-    closedTrades: total,
-    wins: learningModel.wins,
-    losses: learningModel.losses,
+    symbol,
+    name: assets[symbol].name,
+    available: true,
+    ticker: getMarketTicker(market),
+    title: market.title || market.subtitle || "",
+    secondsRemaining: getSecondsRemaining(market),
+    spotPrice: spotPrices[symbol],
+    yesBid: quotes.yesBid,
+    yesAsk: quotes.yesAsk,
+    noBid: quotes.noBid,
+    noAsk: quotes.noAsk,
+    yesMid: quotes.yesMid,
+    signal,
+    openPositions: countOpenPositions(symbol),
+    error: errors[symbol] || null
+  };
+}
+
+function getPerformance() {
+  const wins = wallet.history.filter(
+    trade => trade.pnl > 0
+  ).length;
+
+  const losses = wallet.history.filter(
+    trade => trade.pnl < 0
+  ).length;
+
+  const totalTrades = wallet.history.length;
+
+  const winRate = totalTrades > 0
+    ? (wins / totalTrades) * 100
+    : 0;
+
+  const unrealizedPnL = wallet.positions.reduce(
+    (sum, position) => sum + (position.unrealizedPnL || 0),
+    0
+  );
+
+  const openValue = wallet.positions.reduce(
+    (sum, position) => sum + getPositionValue(position),
+    0
+  );
+
+  return {
+    startingBalance: wallet.startingBalance,
+    cash: wallet.cash,
+    openValue,
+    equity: wallet.cash + openValue,
+    realizedPnL: wallet.realizedPnL,
+    unrealizedPnL,
+    totalPnL: wallet.realizedPnL + unrealizedPnL,
+    totalTrades,
+    wins,
+    losses,
     winRate,
-    modelActive: total >= SETTINGS.learningMinTrades,
-    minimumTradesForAdaptiveSizing: SETTINGS.learningMinTrades,
-    lastUpdated: learningModel.lastUpdated,
-    storage: {
-      connected: supabaseReady(),
-      lastSaved: lastSupabaseSave,
-      error: supabaseError
-    }
+    openPositions: wallet.positions.length
   };
 }
 
 function getStatus() {
-  const openValue = wallet.positions.reduce(
-    (total, position) => total + getPositionValue(position),
-    0
-  );
-
-  const unrealizedPnL = wallet.positions.reduce(
-    (total, position) =>
-      total + getPositionValue(position) - position.cost,
-    0
-  );
-
   return {
     status: "online",
-    lastScan,
-    autoTrading: {
-      ...autoTrading,
-      settings: SETTINGS
-    },
+    bot: "Kalshi Paper Trading Bot",
+    mode: "PAPER TRADING",
+    autoTrading,
     settings: SETTINGS,
-    learning: getLearningStatus(),
-    markets,
-    errors,
     wallet: {
-      startingBalance: wallet.startingBalance,
-      cash: Number(wallet.cash.toFixed(2)),
-      openPositions: wallet.positions.length,
-      openValue: Number(openValue.toFixed(2)),
-      realizedPnL: Number(wallet.realizedPnL.toFixed(2)),
-      unrealizedPnL: Number(unrealizedPnL.toFixed(2)),
-      totalEquity: Number((wallet.cash + openValue).toFixed(2)),
-      totalPnL: Number((wallet.realizedPnL + unrealizedPnL).toFixed(2)),
-      tradesClosed: wallet.history.length
+      ...wallet,
+      performance: getPerformance()
     },
-    positions: wallet.positions,
-    history: wallet.history
+    markets: {
+      BTC: getPublicMarket("BTC"),
+      ETH: getPublicMarket("ETH")
+    },
+    learning: {
+      ...learningModel,
+      enabled: true,
+      mode: "adaptive",
+      minimumTrades: SETTINGS.learningMinTrades,
+      ready:
+        learningModel.closedTrades >= SETTINGS.learningMinTrades
+    },
+    storage: {
+      configured: supabaseReady(),
+      connected: Boolean(lastSupabaseSave),
+      lastSaved: lastSupabaseSave,
+      error: supabaseError
+    },
+    lastScan
   };
 }
 
-function send(res, status, data) {
-  res.writeHead(status, {
+function sendJson(response, statusCode, data) {
+  response.writeHead(statusCode, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type"
   });
 
-  res.end(JSON.stringify(data));
+  response.end(JSON.stringify(data));
 }
 
-function readBody(req) {
+function readBody(request) {
   return new Promise((resolve, reject) => {
     let body = "";
 
-    req.on("data", chunk => {
+    request.on("data", chunk => {
       body += chunk;
-      if (body.length > 100000) {
+
+      if (body.length > 1000000) {
         reject(new Error("Request body too large"));
-        req.destroy();
+        request.destroy();
       }
     });
 
-    req.on("end", () => {
+    request.on("end", () => {
       try {
-        resolve(JSON.parse(body || "{}"));
-      } catch (error) {
-        reject(error);
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        reject(new Error("Invalid JSON body"));
       }
     });
 
-    req.on("error", reject);
+    request.on("error", reject);
   });
-}
-
-const server = http.createServer(async (req, res) => {
-  if (req.method === "OPTIONS") {
-    return send(res, 200, { ok: true });
-  }
-
-  const url = new URL(req.url, "http://localhost");
-
-  if (url.pathname === "/" || url.pathname === "/health") {
-    return send(res, 200, {
-      status: "online",
-      bot: "Kalshi Adaptive Paper Trading Bot",
-      storageConnected: supabaseReady()
+}const server = http.createServer(async (request, response) => {
+  if (request.method === "OPTIONS") {
+    response.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type"
     });
+    return response.end();
   }
 
-  if (url.pathname === "/api/status" && req.method === "GET") {
-    return send(res, 200, getStatus());
-  }
+  const url = new URL(
+    request.url,
+    `http://${request.headers.host || "localhost"}`
+  );
 
-  if (url.pathname === "/api/markets" && req.method === "GET") {
-    return send(res, 200, {
-      lastScan,
-      markets,
-      errors
-    });
-  }
+  try {
+    if (request.method === "GET" && url.pathname === "/") {
+      return sendJson(response, 200, {
+        status: "online",
+        bot: "Kalshi Paper Trading Bot",
+        mode: "PAPER TRADING"
+      });
+    }
 
-  if (url.pathname === "/api/performance" && req.method === "GET") {
-    return send(res, 200, {
-      wallet: getStatus().wallet,
-      positions: wallet.positions,
-      history: wallet.history,
-      autoTrading,
-      learning: getLearningStatus()
-    });
-  }
+    if (request.method === "GET" && url.pathname === "/health") {
+      return sendJson(response, 200, {
+        status: "healthy",
+        timestamp: new Date().toISOString()
+      });
+    }
 
-  if (url.pathname === "/api/learning" && req.method === "GET") {
-    return send(res, 200, {
-      learning: getLearningStatus(),
-      weights: learningModel.weights
-    });
-  }
+    if (request.method === "GET" && url.pathname === "/api/status") {
+      return sendJson(response, 200, getStatus());
+    }
 
-  if (url.pathname === "/api/settings" && req.method === "GET") {
-    return send(res, 200, { settings: SETTINGS });
-  }
+    if (request.method === "GET" && url.pathname === "/api/markets") {
+      return sendJson(response, 200, {
+        BTC: getPublicMarket("BTC"),
+        ETH: getPublicMarket("ETH")
+      });
+    }
 
-  if (url.pathname === "/api/settings" && req.method === "POST") {
-    try {
-      const body = await readBody(req);
+    if (request.method === "GET" && url.pathname === "/api/performance") {
+      return sendJson(response, 200, getPerformance());
+    }
 
-      if (typeof body.highConfidenceEndTrade === "boolean") {
-        SETTINGS.highConfidenceEndTrade = body.highConfidenceEndTrade;
+    if (request.method === "GET" && url.pathname === "/api/learning") {
+      return sendJson(response, 200, {
+        enabled: true,
+        mode: "adaptive",
+        minimumTrades: SETTINGS.learningMinTrades,
+        ready:
+          learningModel.closedTrades >= SETTINGS.learningMinTrades,
+        ...learningModel,
+        storage: {
+          configured: supabaseReady(),
+          connected: Boolean(lastSupabaseSave),
+          lastSaved: lastSupabaseSave,
+          error: supabaseError
+        }
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/settings") {
+      return sendJson(response, 200, SETTINGS);
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/settings") {
+      const body = await readBody(request);
+
+      for (const key of Object.keys(SETTINGS)) {
+        if (!(key in body)) continue;
+
+        if (typeof SETTINGS[key] === "boolean") {
+          if (typeof body[key] === "boolean") {
+            SETTINGS[key] = body[key];
+          }
+        } else {
+          const value = number(body[key]);
+
+          if (value !== null && value >= 0) {
+            SETTINGS[key] = value;
+          }
+        }
       }
 
       scheduleStateSave();
 
-      return send(res, 200, {
+      return sendJson(response, 200, {
         success: true,
         settings: SETTINGS
       });
-    } catch (error) {
-      return send(res, 400, { error: error.message });
     }
-  }
 
-  if (url.pathname === "/api/paper/buy" && req.method === "POST") {
-    try {
-      const body = await readBody(req);
+    if (request.method === "POST" && url.pathname === "/api/paper/buy") {
+      const body = await readBody(request);
+
       const symbol = String(body.symbol || "").toUpperCase();
       const side = String(body.side || "").toUpperCase();
+
+      if (!assets[symbol]) {
+        return sendJson(response, 400, {
+          success: false,
+          error: "Symbol must be BTC or ETH"
+        });
+      }
+
+      const market = markets[symbol];
+
       const amount = number(body.amount);
 
-      if (!assets[symbol] || !["YES", "NO"].includes(side)) {
-        return send(res, 400, { error: "Invalid symbol or side" });
-      }
+      const result = buyPosition(
+        symbol,
+        side,
+        amount,
+        market,
+        {
+          reason: "Manual paper trade"
+        }
+      );
 
-      if (amount === null || amount <= 0) {
-        return send(res, 400, { error: "Invalid amount" });
-      }
-
-      const result = buyPosition(symbol, side, amount, false, "manual");
-
-      if (!result.success) {
-        return send(res, 400, { error: result.error });
-      }
-
-      return send(res, 200, {
-        success: true,
-        position: result.position,
-        status: getStatus()
-      });
-    } catch (error) {
-      return send(res, 400, { error: error.message });
+      return sendJson(
+        response,
+        result.success ? 200 : 400,
+        result
+      );
     }
-  }
 
-  if (url.pathname === "/api/paper/sell" && req.method === "POST") {
-    try {
-      const body = await readBody(req);
-      const position = wallet.positions.find(item => item.id === body.id);
+    if (request.method === "POST" && url.pathname === "/api/paper/sell") {
+      const body = await readBody(request);
 
-      if (!position) {
-        return send(res, 404, { error: "Position not found" });
-      }
+      const result = closePosition(
+        body.positionId,
+        body.reason || "Manual close"
+      );
 
-      closePosition(position, "Manual sale");
-
-      return send(res, 200, {
-        success: true,
-        status: getStatus()
-      });
-    } catch (error) {
-      return send(res, 400, { error: error.message });
+      return sendJson(
+        response,
+        result.success ? 200 : 400,
+        result
+      );
     }
-  }
 
-  if (url.pathname === "/api/auto/pause" && req.method === "POST") {
-    autoTrading.enabled = false;
-    scheduleStateSave();
-    return send(res, 200, { success: true, autoTrading });
-  }
+    if (request.method === "POST" && url.pathname === "/api/auto/pause") {
+      autoTrading.enabled = false;
+      autoTrading.lastAction = "Automatic trading paused";
 
-  if (url.pathname === "/api/auto/resume" && req.method === "POST") {
-    autoTrading.enabled = true;
-    scheduleStateSave();
-    return send(res, 200, { success: true, autoTrading });
-  }
+      scheduleStateSave();
 
-  return send(res, 404, { error: "Not found" });
+      return sendJson(response, 200, {
+        success: true,
+        autoTrading
+      });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/auto/resume") {
+      autoTrading.enabled = true;
+      autoTrading.lastAction = "Automatic trading resumed";
+
+      scheduleStateSave();
+
+      return sendJson(response, 200, {
+        success: true,
+        autoTrading
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/positions") {
+      updatePositionPrices();
+
+      return sendJson(response, 200, {
+        positions: wallet.positions,
+        cash: wallet.cash,
+        performance: getPerformance()
+      });
+    }
+
+    return sendJson(response, 404, {
+      error: "Route not found"
+    });
+
+  } catch (error) {
+    console.error("Server request error:", error.message);
+
+    return sendJson(response, 500, {
+      success: false,
+      error: error.message
+    });
+  }
 });
 
-server.listen(PORT, async () => {
-  console.log("Kalshi Adaptive Paper Trading Bot running");
-  console.log("Supabase persistence:", supabaseReady() ? "configured" : "NOT CONFIGURED");
+async function startBot() {
+  console.log("Starting Kalshi paper trading bot...");
 
   await loadPersistentState();
-  await scanMarkets();
 
-  setInterval(scanMarkets, SETTINGS.scanInterval);
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`Bot server listening on port ${PORT}`);
+    console.log("Paper wallet:", wallet.cash);
+    console.log("BTC and ETH enabled");
+    console.log("Scan interval:", SETTINGS.scanInterval);
+    console.log("Prediction window:", SETTINGS.predictionWindowSeconds);
+  });
 
-  // A periodic backup in addition to saves after important changes.
-  setInterval(persistState, 30000);
-});
+  await scanAll();
 
-process.on("SIGTERM", async () => {
-  console.log("SIGTERM received; saving bot state...");
-  await persistState();
-  server.close(() => process.exit(0));
+  setInterval(() => {
+    scanAll().catch(error => {
+      console.error("Scheduled scan failed:", error.message);
+    });
+  }, SETTINGS.scanInterval);
+
+  setInterval(() => {
+    automaticExitChecks();
+  }, 1000);
+
+  setInterval(() => {
+    persistState().catch(error => {
+      console.error("Scheduled save failed:", error.message);
+    });
+  }, 15000);
+}
+
+startBot().catch(error => {
+  console.error("Bot startup failed:", error);
+  process.exit(1);
 });
