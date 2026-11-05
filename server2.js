@@ -1110,12 +1110,27 @@ function buyPosition(
 
   wallet.positions.push(position);
 
-  autoTrading.tradesOpened++;
+// Add the trade to history immediately
+const historyTrade = {
+  ...position,
+  status: "OPEN",
+  outcome: "OPEN",
+  exitPrice: null,
+  pnl: 0,
+  closedAt: null
+};
 
-  autoTrading.lastAction =
-    `Bought ${side} ${symbol} for $${amount.toFixed(2)}`;
+wallet.history.unshift(historyTrade);
 
-  scheduleStateSave();
+// Keep history limited to 500 records
+wallet.history = wallet.history.slice(0, 500);
+
+autoTrading.tradesOpened++;
+
+autoTrading.lastAction =
+  `Bought ${side} ${symbol} for $${amount.toFixed(2)}`;
+
+scheduleStateSave();
 
   return {
     success: true,
@@ -1260,7 +1275,6 @@ function closePosition(
     proceeds - position.amount;
 
   wallet.cash += proceeds;
-
   wallet.realizedPnL += pnl;
 
   const closedAt = new Date().toISOString();
@@ -1268,20 +1282,30 @@ function closePosition(
   const trade = {
     ...position,
 
+    status: "CLOSED",
     exitPrice,
     proceeds,
     pnl,
 
     outcome:
-      pnl >= 0
-        ? "WIN"
-        : "LOSS",
+      pnl >= 0 ? "WIN" : "LOSS",
 
     reason,
     closedAt
   };
 
-  wallet.history.unshift(trade);
+  // Find the existing OPEN history record
+  const historyIndex = wallet.history.findIndex(
+    item => item.id === position.id
+  );
+
+  if (historyIndex !== -1) {
+    // Update existing record
+    wallet.history[historyIndex] = trade;
+  } else {
+    // Add closed trade if it wasn't previously recorded
+    wallet.history.unshift(trade);
+  }
 
   wallet.history =
     wallet.history.slice(0, 500);
@@ -1291,7 +1315,9 @@ function closePosition(
   autoTrading.tradesClosed++;
 
   autoTrading.lastAction =
-    `Closed ${position.side} ${position.symbol}: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`;
+    `Closed ${position.side} ${position.symbol}: ${
+      pnl >= 0 ? "+" : ""
+    }$${pnl.toFixed(2)}`;
 
   updateLearningModel(trade);
 
