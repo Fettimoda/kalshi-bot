@@ -1371,8 +1371,11 @@ function automaticBuy(symbol, market, signal) {
 
   if (
     !signal ||
+    !signal.action ||
     !signal.action.startsWith("BUY_")
   ) {
+    autoTrading.lastAction =
+      `${symbol}: Waiting for qualifying signal`;
     return;
   }
 
@@ -1385,6 +1388,8 @@ function automaticBuy(symbol, market, signal) {
     now - lastTrade <
     SETTINGS.signalCooldown
   ) {
+    autoTrading.lastAction =
+      `${symbol}: Signal cooldown`;
     return;
   }
 
@@ -1392,6 +1397,8 @@ function automaticBuy(symbol, market, signal) {
     countOpenPositions(symbol) >=
     SETTINGS.maxOpenPositionsPerMarket
   ) {
+    autoTrading.lastAction =
+      `${symbol}: Maximum crypto positions reached`;
     return;
   }
 
@@ -1399,6 +1406,8 @@ function automaticBuy(symbol, market, signal) {
     wallet.positions.length >=
     SETTINGS.maxOpenPositions
   ) {
+    autoTrading.lastAction =
+      "Maximum open positions reached";
     return;
   }
 
@@ -1409,6 +1418,8 @@ function automaticBuy(symbol, market, signal) {
     secondsRemaining !== null &&
     secondsRemaining <= 0
   ) {
+    autoTrading.lastAction =
+      `${symbol}: Market expired`;
     return;
   }
 
@@ -1421,7 +1432,11 @@ function automaticBuy(symbol, market, signal) {
     signal.confidence || 0.5
   );
 
-  if (amount <= 0) return;
+  if (amount <= 0) {
+    autoTrading.lastAction =
+      `${symbol}: Trade size is zero`;
+    return;
+  }
 
   const result = buyPosition(
     symbol,
@@ -1431,11 +1446,18 @@ function automaticBuy(symbol, market, signal) {
     signal
   );
 
-  if (result.success) {
-    lastAutoTrade[symbol] = now;
-
-    scheduleStateSave();
+  if (!result.success) {
+    autoTrading.lastAction =
+      `${symbol}: ${result.error}`;
+    return;
   }
+
+  lastAutoTrade[symbol] = now;
+
+  autoTrading.lastAction =
+    `OPENED ${side} ${symbol} $${amount.toFixed(2)}`;
+
+  scheduleStateSave();
 }
 
 // ------------------------------
