@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const PORT = process.env.PORT || 3000;
 
 const API = "https://external-api.kalshi.com/trade-api/v2";
-const BINANCE_API = "https://api.binance.com/api/v3/ticker/price";
+const KRAKEN_API = "https://api.kraken.com/0/public/Ticker";
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -359,17 +359,39 @@ function scheduleStateSave() {
 // ------------------------------
 
 async function fetchSpotPrice(symbol) {
+  const pairMap = {
+    BTCUSDT: "XBTUSD",
+    ETHUSDT: "ETHUSD"
+  };
+
+  const pair = pairMap[symbol];
+
+  if (!pair) {
+    throw new Error(`Unsupported Kraken symbol: ${symbol}`);
+  }
+
   const response = await fetch(
-    `${BINANCE_API}?symbol=${symbol}`
+    `${KRAKEN_API}?pair=${pair}`
   );
 
   if (!response.ok) {
-    throw new Error(`Binance HTTP ${response.status}`);
+    throw new Error(`Kraken HTTP ${response.status}`);
   }
 
   const data = await response.json();
 
-  return number(data.price);
+  if (data.error && data.error.length > 0) {
+    throw new Error(`Kraken error: ${data.error.join(", ")}`);
+  }
+
+  const result = data.result;
+  const marketData = Object.values(result)[0];
+
+  if (!marketData || !marketData.c) {
+    throw new Error("Kraken price unavailable");
+  }
+
+  return number(marketData.c[0]);
 }
 
 function recordSpotPrice(symbol, price) {
