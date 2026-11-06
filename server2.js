@@ -610,18 +610,30 @@ async function refreshMarket(symbol) {
     const ticker = getMarketTicker(current);
     const closeTime = getMarketCloseTime(current);
 
+    // Refresh prices for the currently active market
     if (
       ticker &&
       closeTime &&
       closeTime > Date.now()
     ) {
-      return current;
+      const data = await apiGet(
+        `/markets/${encodeURIComponent(ticker)}`
+      );
+
+      const updatedMarket = data.market || data;
+
+      if (getMarketTicker(updatedMarket)) {
+        markets[symbol] = updatedMarket;
+        errors[symbol] = null;
+
+        return updatedMarket;
+      }
     }
 
+    // Find the next active market if the current one expired
     const market = await findActiveMarket(symbol);
 
     if (!market) {
-      markets[symbol] = null;
       errors[symbol] = "No active 15-minute market found";
       return null;
     }
@@ -633,6 +645,11 @@ async function refreshMarket(symbol) {
 
   } catch (error) {
     errors[symbol] = error.message;
+
+    console.error(
+      `${symbol} market refresh failed:`,
+      error.message
+    );
 
     return markets[symbol] || null;
   }
