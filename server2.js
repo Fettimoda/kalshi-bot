@@ -1681,15 +1681,19 @@ function getPublicMarket(symbol) {
 // ------------------------------
 
 function getPerformance() {
-  const wins = wallet.history.filter(
+  const closedTrades = wallet.history.filter(
+    trade => trade.status === "CLOSED"
+  );
+
+  const wins = closedTrades.filter(
     trade => trade.pnl > 0
   ).length;
 
-  const losses = wallet.history.filter(
+  const losses = closedTrades.filter(
     trade => trade.pnl < 0
   ).length;
 
-  const totalTrades = wallet.history.length;
+  const totalTrades = closedTrades.length;
 
   const winRate =
     totalTrades > 0
@@ -1712,27 +1716,16 @@ function getPerformance() {
 
   return {
     startingBalance: wallet.startingBalance,
-
     cash: wallet.cash,
-
     openValue,
-
     equity: wallet.cash + openValue,
-
     realizedPnL: wallet.realizedPnL,
-
     unrealizedPnL,
-
-    totalPnL:
-      wallet.realizedPnL + unrealizedPnL,
-
+    totalPnL: wallet.realizedPnL + unrealizedPnL,
     totalTrades,
-
     wins,
     losses,
-
     winRate,
-
     openPositions: wallet.positions.length
   };
 }
