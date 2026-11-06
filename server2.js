@@ -869,7 +869,7 @@ function getSignal(symbol, market) {
 
   const spread = getMarketSpread(quotes);
 
-  if (spread === null || spread > 0.10) {
+  if (spread === null || spread > 0.05) {
     return {
       action: "WAIT",
       reason: "Market spread is too wide",
