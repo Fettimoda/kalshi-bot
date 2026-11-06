@@ -901,7 +901,20 @@ function getSignal(symbol, market) {
       prediction
     };
   }
-
+// Avoid trades when spot and contract movements conflict
+if (
+  contractOpportunity &&
+  spotOpportunity &&
+  Math.sign(features.contract20Cents) !==
+  Math.sign(features.spot20Bps)
+) {
+  return {
+    action: "WAIT",
+    reason: "Spot and contract signals disagree",
+    features,
+    prediction
+  };
+}
   if (prediction.confidence < 0.60) {
     return {
       action: "WAIT",
