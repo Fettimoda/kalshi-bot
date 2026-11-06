@@ -902,7 +902,7 @@ function getSignal(symbol, market) {
     };
   }
 
-  if (prediction.confidence < 0.51) {
+  if (prediction.confidence < 0.60) {
     return {
       action: "WAIT",
       reason: "Prediction confidence is too low",
