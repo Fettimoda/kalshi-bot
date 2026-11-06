@@ -14,8 +14,8 @@ const SETTINGS = {
   tradeAmount: 1,
   regularMaxTradeAmount: 1.5,
 
-  maxOpenPositions: 4,
-  maxOpenPositionsPerMarket: 2,
+  maxOpenPositions: 6,
+  maxOpenPositionsPerMarket: 3,
 
   scanInterval: 2000,
   signalCooldown: 10000,
