@@ -2108,7 +2108,56 @@ const server = http.createServer(
           autoTrading
         });
       }
+// RESET PAPER WALLET
 
+if (
+  request.method === "POST" &&
+  url.pathname === "/api/reset"
+) {
+  // Keep automatic trading paused
+  autoTrading.enabled = false;
+
+  // Reset wallet
+  wallet.startingBalance = 5;
+  wallet.cash = 5;
+  wallet.realizedPnL = 0;
+  wallet.positions = [];
+  wallet.history = [];
+
+  // Reset learning statistics
+  learningModel.closedTrades = 0;
+  learningModel.wins = 0;
+  learningModel.losses = 0;
+  learningModel.lastUpdated = null;
+
+  learningModel.weights = {
+    bias: 0,
+    spot20Bps: 0,
+    spot60Bps: 0,
+    contract20Cents: 0,
+    contract60Cents: 0,
+    spreadCents: 0,
+    timeRemaining: 0,
+    strikeDistanceBps: 0
+  };
+
+  // Reset trade counters
+  autoTrading.tradesOpened = 0;
+  autoTrading.tradesClosed = 0;
+
+  autoTrading.lastAction =
+    "Paper wallet reset to $5.00. Trading paused.";
+
+  await persistState();
+
+  return sendJson(response, 200, {
+    success: true,
+    message: "Paper wallet successfully reset",
+    wallet,
+    learning: learningModel,
+    autoTrading
+  });
+}
       // OPEN POSITIONS
 
       if (
