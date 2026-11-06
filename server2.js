@@ -992,17 +992,7 @@ function buyPosition(
     };
   }
 
-  // Prevent duplicate positions on the same market
-  const duplicate = wallet.positions.some(
-    position => position.ticker === ticker
-  );
-
-  if (duplicate) {
-    return {
-      success: false,
-      error: "Already holding this market"
-    };
-  }
+  
 
   if (
     wallet.positions.length >=
