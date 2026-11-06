@@ -18,10 +18,10 @@ const SETTINGS = {
   maxOpenPositionsPerMarket: 3,
 
   scanInterval: 2000,
-  signalCooldown: 10000,
+  signalCooldown: 5000,
   predictionWindowSeconds: 10,
 
-  minimumPredictedMoveCents: 1,
+  minimumPredictedMoveCents: 0.5,
   minimumSpotMovePercent: 0.005,
 
   takeProfit: 0.15,
