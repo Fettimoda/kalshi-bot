@@ -901,16 +901,22 @@ function getSignal(symbol, market) {
       prediction
     };
   }
-// Avoid trades when spot and contract movements conflict
+// Allow late entries only when the selected contract is 80¢+
+const secondsRemaining = getSecondsRemaining(market);
+
+const selectedAsk =
+  prediction.predictedSide === "YES"
+    ? quotes.yesAsk
+    : quotes.noAsk;
+
 if (
-  contractOpportunity &&
-  spotOpportunity &&
-  Math.sign(features.contract20Cents) !==
-  Math.sign(features.spot20Bps)
+  secondsRemaining !== null &&
+  secondsRemaining < 60 &&
+  selectedAsk < 0.80
 ) {
   return {
     action: "WAIT",
-    reason: "Spot and contract signals disagree",
+    reason: "Late market entry below 80¢",
     features,
     prediction
   };
